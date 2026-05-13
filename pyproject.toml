@@ -1,0 +1,24 @@
+[project]
+name = "langgraph-api-server"
+version = "0.1.0"
+description = "A fastapi based langgraph server"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aredis>=1.1.8",
+    "fastapi>=0.136.1",
+    "langchain-openai>=1.2.1",
+    "langfuse>=4.6.1",
+    "langgraph>=1.2.0",
+    "langgraph-checkpoint-postgres>=3.1.0",
+    "psycopg[binary,pool]>=3.3.4",
+    "rq>=2.8.0",
+    "uuid-utils>=0.15.0",
+    "uvicorn>=0.46.0",
+]
+
+[dependency-groups]
+dev = [
+    "deepagents>=0.6.1",
+    "python-dotenv>=1.2.2",
+]
