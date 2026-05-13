@@ -95,7 +95,7 @@ def setup_api(
     if "prefix" in _kwargs:
         prefix = _kwargs.pop("prefix")
     else:
-        prefix = "/langgragh_api"
+        prefix = "/langgraph_api"
     router.include_router(lg_api_router, prefix=prefix, **_kwargs)
 
     _settings.configure(
