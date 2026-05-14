@@ -183,7 +183,7 @@ langgraph_api/
 - 默认 API 前缀为 `/langgraph_api`（代码中为 `langgragh`，历史拼写错误），可通过 `include_router_kwargs={"prefix": "/your_prefix"}` 覆盖。
 - HNSW 索引不支持超过 2000 维的 Embedding。
 - `user_id_callback` 不参与子进程序列化，因为它可能依赖 FastAPI 请求上下文。
-- 本项目为社区逆向实现，API 行为可能与官方 LangGraph 服务器存在差异。
+- 本项目为vibe coding参考官方的客户端sdk实现，API 行为可能与官方 LangGraph 服务器存在差异。
 
 ## 许可证
 

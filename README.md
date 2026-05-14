@@ -11,7 +11,7 @@ The official LangGraph server is tightly coupled with LangSmith, making it inacc
 - **Self-hosting costs** — the official open-source version lacks auth and other modules; full self-hosted deployment requires an enterprise LangSmith license
 - **Deployment overhead** — the official server runs Python via gRPC to a Go backend, meaning you can't just deploy it as a simple Python service
 
-This project was reverse-engineered from the LangGraph client-side SDK, so behavior is **not guaranteed to be identical** to the official server. If you find inconsistencies, please open an issue.
+I vibe coding this project with the reference of the LangGraph client-side SDK, so behavior is **not guaranteed to be identical** to the official server. If you find inconsistencies, please open an issue.
 
 ## Features
 
