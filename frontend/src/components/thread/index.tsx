@@ -3,6 +3,9 @@ import { ReactNode, useEffect, useRef } from "react";
 import { motion } from "framer-motion";
 import { cn } from "@/lib/utils";
 import { useStreamContext } from "@/providers/Stream";
+import { getThreadSearchMetadata } from "@/providers/Thread";
+import { createClient } from "@/providers/client";
+import { getApiKey } from "@/lib/api-key";
 import { useState, FormEvent } from "react";
 import { Button } from "../ui/button";
 import { Checkpoint, Message } from "@langchain/langgraph-sdk";
@@ -116,6 +119,15 @@ export function Thread() {
   const [artifactOpen, closeArtifact] = useArtifactOpen();
 
   const [threadId, _setThreadId] = useQueryState("threadId");
+  const envAssistantId: string | undefined = import.meta.env.VITE_ASSISTANT_ID;
+  const envApiUrl: string | undefined = import.meta.env.VITE_API_URL;
+  const envAuthScheme: string | undefined = import.meta.env.VITE_AUTH_SCHEME;
+  const [assistantId] = useQueryState("assistantId");
+  const [apiUrl] = useQueryState("apiUrl", { defaultValue: envApiUrl || "" });
+  const [authScheme] = useQueryState("authScheme", {
+    defaultValue: envAuthScheme || "",
+  });
+  const resolvedAssistantId = assistantId || envAssistantId;
   const [chatHistoryOpen, setChatHistoryOpen] = useQueryState(
     "chatHistoryOpen",
     parseAsBoolean.withDefault(false),
@@ -194,7 +206,7 @@ export function Thread() {
     prevMessageLength.current = messages.length;
   }, [messages]);
 
-  const handleSubmit = (e: FormEvent) => {
+  const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     if ((input.trim().length === 0 && contentBlocks.length === 0) || isLoading)
       return;
@@ -214,9 +226,30 @@ export function Thread() {
     const context =
       Object.keys(artifactContext).length > 0 ? artifactContext : undefined;
 
+    const threadMetadata = resolvedAssistantId
+      ? getThreadSearchMetadata(resolvedAssistantId)
+      : undefined;
+
+    let submitThreadId = threadId;
+
+    if (!submitThreadId && apiUrl && resolvedAssistantId) {
+      const client = createClient(
+        apiUrl,
+        getApiKey() ?? undefined,
+        authScheme || undefined,
+      );
+      const thread = await client.threads.create({
+        graphId: resolvedAssistantId,
+      });
+      submitThreadId = thread.thread_id;
+      _setThreadId(submitThreadId);
+    }
+
     stream.submit(
       { messages: [...toolMessages, newHumanMessage], context },
       {
+        ...(submitThreadId && { threadId: submitThreadId }),
+        metadata: threadMetadata,
         streamMode: ["values"],
         streamSubgraphs: true,
         streamResumable: true,

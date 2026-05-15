@@ -23,7 +23,7 @@ interface ThreadContextType {
 
 const ThreadContext = createContext<ThreadContextType | undefined>(undefined);
 
-function getThreadSearchMetadata(
+export function getThreadSearchMetadata(
   assistantId: string,
 ): { graph_id: string } | { assistant_id: string } {
   if (validate(assistantId)) {
@@ -35,8 +35,7 @@ function getThreadSearchMetadata(
 
 export function ThreadProvider({ children }: { children: ReactNode }) {
   const envApiUrl: string | undefined = import.meta.env.VITE_API_URL;
-  const envAssistantId: string | undefined =
-    import.meta.env.VITE_ASSISTANT_ID;
+  const envAssistantId: string | undefined = import.meta.env.VITE_ASSISTANT_ID;
   const envAuthScheme: string | undefined = import.meta.env.VITE_AUTH_SCHEME;
 
   const [apiUrl] = useQueryState("apiUrl", {
