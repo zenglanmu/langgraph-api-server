@@ -26,3 +26,4 @@ dist-ssr
 # LangGraph API
 .langgraph_api
 .env
+frontend/tsconfig.tsbuildinfo
