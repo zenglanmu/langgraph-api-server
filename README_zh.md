@@ -1,6 +1,8 @@
 # LangGraph API Server
 
-基于 FastAPI 的独立 LangGraph API 服务器——官方 LangGraph 服务器的替代方案。官方服务器依赖 Go 语言编写的 LangSmith 后端，无法独立运行。
+基于 FastAPI 的独立 LangGraph API 服务器，内置 React 聊天界面——官方 LangGraph 服务器的替代方案。官方服务器依赖 Go 语言编写的 LangSmith 后端，无法独立运行。
+
+**[English](README.md)**
 
 ## 为什么需要这个项目？
 
@@ -16,6 +18,7 @@
 ## 特性
 
 - **可嵌入** — 通过 `setup_api()` 挂载到任意 FastAPI 应用中，无需单独部署
+- **内置聊天界面** — React 实现的 Agent 聊天 UI（`agent-chat-ui`），位于 `frontend/` 目录
 - **PostgreSQL + Redis 持久化** — 支持线程、助手、定时任务和存储的持久化
 - **后台执行** — 长耗时 agent 任务通过 Redis rq 队列在后台 Worker 进程中执行，不阻塞 FastAPI 主进程
 - **SSE 流式输出** — 支持 Server-Sent Events 实时返回运行结果
@@ -27,13 +30,18 @@
 - Python >= 3.12
 - PostgreSQL
 - Redis
+- Node.js（前端开发需要）
 
 ## 快速开始
 
 ### 1. 安装
 
 ```bash
+# 后端
 uv sync
+
+# 前端（在 frontend/ 目录下）
+cd frontend && pnpm install && cd ..
 ```
 
 ### 2. 配置环境变量
@@ -42,6 +50,7 @@ uv sync
 
 ```bash
 cp .env.example .env
+cp frontend/.env.example frontend/.env
 ```
 
 所有可用变量见 `.env.example`。
@@ -112,10 +121,42 @@ app.include_router(router, prefix="/my_api")
 
 ### 5. 运行
 
+**后端 + 前端一起启动（推荐）：**
+
+```bash
+uv run python dev.py
+# 后端  -> http://localhost:2024
+# 前端  -> http://localhost:5173
+```
+
+一条命令同时启动后端 API 服务和前端开发服务器，并自动将 `.env.example` 复制为 `.env`（如果 `.env` 不存在）。
+
+**仅后端：**
+
 ```bash
 uv run python examples/main.py
 # 服务地址: http://127.0.0.1:2024
 ```
+
+**仅前端：**
+
+```bash
+cd frontend && pnpm dev
+# 服务地址: http://localhost:5173
+```
+
+## 前端
+
+`frontend/` 目录包含 **agent-chat-ui**，一个通过 LangGraph SDK 与后端通信的 React 聊天界面。
+
+- **技术栈**: React 19, TypeScript, Vite, TailwindCSS 4, pnpm
+- **Vite 代理**: 开发模式下，`/api` 请求会被代理到 `http://localhost:2024`（自动去除 `/api` 前缀）。生产构建中使用 `VITE_API_URL` 直接访问后端。
+- **环境变量**（`frontend/.env`）：
+  - `VITE_API_URL` — 后端地址（默认: `http://localhost:2024`）
+  - `VITE_ASSISTANT_ID` — 默认助手 ID（默认: `agent`）
+  - `VITE_AUTH_SCHEME` — Agent Builder 部署的认证方式（如 `langsmith-api-key`）
+- **构建**: `pnpm build` 执行 `tsc -b && vite build`，输出到 `frontend/dist/`
+- **代码检查**: `pnpm lint`（eslint），`pnpm format:check`（prettier + `prettier-plugin-tailwindcss`）
 
 ## API 参考
 
@@ -170,6 +211,19 @@ langgraph_api/
 │   └── setup.py         # 数据库表初始化
 └── utils/
     └── queue_worker.py  # rq Worker 池 + 定时任务调度器
+
+frontend/
+├── src/
+│   ├── App.tsx                    # StreamProvider > ThreadProvider > ArtifactProvider > Thread
+│   ├── providers/
+│   │   ├── client.ts              # LangGraph SDK 客户端配置
+│   │   ├── Stream.tsx             # SSE 流式 Provider
+│   │   └── Thread.tsx             # 线程状态 Provider
+│   └── components/
+│       ├── thread/                # 聊天线程 UI、消息、Markdown 渲染、agent-inbox 中断处理
+│       └── ui/                    # shadcn/ui 基础组件（基于 Radix UI）
+├── vite.config.ts                 # 开发代理: /api → http://localhost:2024
+└── package.json                   # agent-chat-ui
 ```
 
 **启动机制**：多 Worker 部署时，仅有一个进程执行数据库初始化和启动后台进程（基于 Redis 分布式锁，key 为 `langgraph_api:bg_startup_lock`）。
@@ -183,7 +237,7 @@ langgraph_api/
 - 默认 API 前缀为 `/langgraph_api`（代码中为 `langgragh`，历史拼写错误），可通过 `include_router_kwargs={"prefix": "/your_prefix"}` 覆盖。
 - HNSW 索引不支持超过 2000 维的 Embedding。
 - `user_id_callback` 不参与子进程序列化，因为它可能依赖 FastAPI 请求上下文。
-- 本项目为vibe coding参考官方的客户端sdk实现，API 行为可能与官方 LangGraph 服务器存在差异。
+- 本项目为 vibe coding 参考官方客户端 SDK 实现，API 行为可能与官方 LangGraph 服务器存在差异。
 
 ## 许可证
 

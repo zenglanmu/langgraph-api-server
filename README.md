@@ -1,6 +1,8 @@
 # LangGraph API Server
 
-A standalone FastAPI-based LangGraph API server — an alternative to the official LangGraph server, which requires a Go-based LangSmith backend and cannot run independently.
+A standalone FastAPI-based LangGraph API server with a built-in React chat UI — an alternative to the official LangGraph server, which requires a Go-based LangSmith backend and cannot run independently.
+
+**[中文文档](README_zh.md)**
 
 ## Why This Project?
 
@@ -16,6 +18,7 @@ I vibe coding this project with the reference of the LangGraph client-side SDK, 
 ## Features
 
 - **Embeddable** — mount into any existing FastAPI app via `setup_api()`, no need to deploy a standalone server
+- **Built-in Chat UI** — React-based agent chat interface (`agent-chat-ui`) included in `frontend/`
 - **PostgreSQL + Redis backed** — persistent storage for threads, assistants, crons, and store
 - **Background execution** — long-running agent tasks are offloaded to rq workers via Redis, keeping the FastAPI process responsive
 - **SSE streaming** — supports server-sent events for real-time run output
@@ -27,13 +30,18 @@ I vibe coding this project with the reference of the LangGraph client-side SDK, 
 - Python >= 3.12
 - PostgreSQL
 - Redis
+- Node.js (for frontend development)
 
 ## Quick Start
 
 ### 1. Install
 
 ```bash
+# Backend
 uv sync
+
+# Frontend (from frontend/)
+cd frontend && pnpm install && cd ..
 ```
 
 ### 2. Configure Environment
@@ -42,6 +50,7 @@ Copy `.env.example` to `.env` and fill in your values (`.env` is excluded from v
 
 ```bash
 cp .env.example .env
+cp frontend/.env.example frontend/.env
 ```
 
 See `.env.example` for all available variables.
@@ -91,7 +100,7 @@ langgraph_api_lifespan = setup_api(
     redis_url=os.environ["REDIS_URL"],
     langgraph_database_uri=os.environ["LANGGRAPH_DATABASE_URI"],
     embeding_model_name=os.environ.get("LANGGRAPH_EMBED_MODEL"),
-    embeding_dim=int(os.environ["LANGGRAPH_EMBED_DIMENSION"]),
+    embeding_dim=int(os.environ["LANGGRAPH_EMBED_DIMENSION"]) if os.environ.get("LANGGRAPH_EMBED_DIMENSION") else None,
     embeding_base_url=os.environ.get("LANGGRAPH_EMBED_MODEL_BASE_URL"),
     embeding_api_key=os.environ.get("LANGGRAPH_EMBED_MODEL_API_KEY"),
     include_router_kwargs=dict(prefix=""),  # default is /langgraph_api
@@ -112,10 +121,42 @@ app.include_router(router, prefix="/my_api")
 
 ### 5. Run
 
+**Backend + Frontend together (recommended):**
+
+```bash
+uv run python dev.py
+# Backend  -> http://localhost:2024
+# Frontend -> http://localhost:5173
+```
+
+This starts both the backend API server and the frontend dev server with a single command, and automatically copies `.env.example` → `.env` if `.env` doesn't exist.
+
+**Backend only:**
+
 ```bash
 uv run python examples/main.py
 # Serves on http://127.0.0.1:2024
 ```
+
+**Frontend only:**
+
+```bash
+cd frontend && pnpm dev
+# Serves on http://localhost:5173
+```
+
+## Frontend
+
+The `frontend/` directory contains **agent-chat-ui**, a React chat interface that communicates with the backend via the LangGraph SDK.
+
+- **Stack**: React 19, TypeScript, Vite, TailwindCSS 4, pnpm
+- **Vite proxy**: In dev mode, requests to `/api` are proxied to `http://localhost:2024` (the `/api` prefix is stripped). In production builds, `VITE_API_URL` is used directly.
+- **Env vars** (`frontend/.env`):
+  - `VITE_API_URL` — backend URL (default: `http://localhost:2024`)
+  - `VITE_ASSISTANT_ID` — default assistant ID (default: `agent`)
+  - `VITE_AUTH_SCHEME` — auth scheme for Agent Builder deployments (e.g. `langsmith-api-key`)
+- **Build**: `pnpm build` runs `tsc -b && vite build`, output to `frontend/dist/`
+- **Lint**: `pnpm lint` (eslint), `pnpm format:check` (prettier with `prettier-plugin-tailwindcss`)
 
 ## API Reference
 
@@ -170,6 +211,19 @@ langgraph_api/
 │   └── setup.py         # DB table initialization
 └── utils/
     └── queue_worker.py  # rq worker pool + cron scheduler
+
+frontend/
+├── src/
+│   ├── App.tsx                    # StreamProvider > ThreadProvider > ArtifactProvider > Thread
+│   ├── providers/
+│   │   ├── client.ts              # LangGraph SDK client setup
+│   │   ├── Stream.tsx             # SSE stream provider
+│   │   └── Thread.tsx             # Thread state provider
+│   └── components/
+│       ├── thread/                # chat thread UI, messages, markdown, agent-inbox interrupts
+│       └── ui/                    # shadcn/ui primitives (Radix UI based)
+├── vite.config.ts                 # dev proxy: /api → http://localhost:2024
+└── package.json                   # agent-chat-ui
 ```
 
 **Startup**: Only one process in a multi-worker deployment runs DB setup and spawns background workers (Redis-based distributed lock with key `langgraph_api:bg_startup_lock`).
@@ -180,7 +234,7 @@ langgraph_api/
 
 ## Caveats
 
-- The default API prefix is `/langgraph_api` (note the typo — `langgragh` in code). Override it via `include_router_kwargs={"prefix": "/your_prefix"}`.
+- The default API prefix is `/langgraph_api`. Override it via `include_router_kwargs={"prefix": "/your_prefix"}`.
 - ANN (HNSW) index does not support embeddings with more than 2000 dimensions.
 - `user_id_callback` is excluded from subprocess serialization since it may depend on FastAPI request context.
 - This is a community implementation reverse-engineered from the client SDK — API behavior may differ from the official LangGraph server.
