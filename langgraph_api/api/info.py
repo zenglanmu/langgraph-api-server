@@ -24,5 +24,5 @@ SERVER_INFO = {
 }
 
 @router.get("")
-async def info(self)->dict:
+async def info()->dict:
     return SERVER_INFO

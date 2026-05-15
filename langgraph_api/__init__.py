@@ -18,8 +18,7 @@ from contextlib import asynccontextmanager
 from typing import Callable, Awaitable, AsyncIterator
 from fastapi import APIRouter, FastAPI
 
-
-from .api import runs, threads, assistants, store, crons
+from .api import lg_api_router
 from .registry import _settings, UserIdCallback, GraphRegistry, get_graph_store, get_graph_checkpointer
 from .persistants import setup
 from .utils.queue_worker import backgroud_worker_pool, backgroud_cron, get_redis_client
@@ -27,12 +26,7 @@ from .utils.queue_worker import backgroud_worker_pool, backgroud_cron, get_redis
 
 logger = logging.getLogger(__name__)
 
-lg_api_router = APIRouter()
-lg_api_router.include_router(runs.router)
-lg_api_router.include_router(threads.router)
-lg_api_router.include_router(assistants.router)
-lg_api_router.include_router(store.router)
-lg_api_router.include_router(crons.router)
+
 
 _WORKER_PID: int | None = None
 _CRON_PID: int | None = None
