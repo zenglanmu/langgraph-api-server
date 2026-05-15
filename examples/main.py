@@ -7,7 +7,7 @@ from langgraph_api import setup_api
 import uvicorn
 
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(override=True)
 
 import examples.agents
 
