@@ -63,7 +63,6 @@ class Command(BaseModel):
 
 
 class Checkpoint(BaseModel):
-    thread_id: str
     checkpoint_ns: str = ""
     checkpoint_id: str | None = None
     checkpoint_map: dict[str, Any] | None = None
@@ -463,13 +462,27 @@ def convert_checkpoint_tuple_to_thread_state(
             checkpoint_map=None
         )
     
-    values = {}    
-    # Handle messages serialization - convert LangChain message objects to dicts
-    if "messages" in checkpoint_tuple.checkpoint['channel_values']:
-        from langchain_core.messages import BaseMessage
-        messages: list[BaseMessage] = checkpoint_tuple.checkpoint['channel_values']["messages"]
-        if len(messages)>0:
-            if isinstance(messages[0], dict):                
+    from langchain_core.messages import BaseMessage
+
+    values = {}
+    channel_values = checkpoint_tuple.checkpoint['channel_values']
+
+    pending_writes = checkpoint_tuple.pending_writes or []
+    pending_by_channel: dict[str, list[Any]] = {}
+    for task_id, channel, value in pending_writes:
+        pending_by_channel.setdefault(channel, []).append(value)
+
+    merged_values: dict[str, Any] = {**channel_values}
+    for channel, pending_vals in pending_by_channel.items():
+        if channel not in merged_values:
+            merged_values[channel] = pending_vals
+        elif isinstance(merged_values[channel], list):
+            merged_values[channel] = [*merged_values[channel], *pending_vals]
+
+    if "messages" in merged_values:
+        messages: list[BaseMessage] = merged_values["messages"]
+        if len(messages) > 0:
+            if isinstance(messages[0], dict):
                 values['messages'] = messages
             else:
                 values['messages'] = [m.model_dump() for m in messages]
