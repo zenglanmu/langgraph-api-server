@@ -1,6 +1,7 @@
 from datetime import datetime
 from typing import Generic, Literal, Sequence, TypeVar
 from langgraph.checkpoint.base import CheckpointTuple
+from langgraph.types import StateSnapshot
 from pydantic import BaseModel, Field, ConfigDict, computed_field, model_validator
 from typing import Optional, Dict, Any, List
 
@@ -30,6 +31,7 @@ StreamMode = Literal[
     "tasks",
     "checkpoints",
     "debug",
+    "tools",
     "custom",
     "messages-tuple",
 ]
@@ -510,6 +512,90 @@ def convert_checkpoint_tuple_to_thread_state(
         tasks=tasks or [],
         interrupts=interrupts or []
     )
+
+def convert_state_snapshot_to_thread_state(snapshot: StateSnapshot) -> ThreadState:
+    from langchain_core.messages import BaseMessage
+
+    configurable = snapshot.config.get("configurable", {})
+    thread_id = configurable.get("thread_id", "")
+    checkpoint_ns = configurable.get("checkpoint_ns", "")
+    checkpoint_id = configurable.get("checkpoint_id", "")
+
+    checkpoint = Checkpoint(
+        thread_id=thread_id,
+        checkpoint_ns=checkpoint_ns,
+        checkpoint_id=checkpoint_id,
+        checkpoint_map=None,
+    )
+
+    parent_config = None
+    if snapshot.parent_config:
+        parent_configurable = snapshot.parent_config.get("configurable", {})
+        parent_config = Checkpoint(
+            thread_id=parent_configurable.get("thread_id", thread_id),
+            checkpoint_ns=parent_configurable.get("checkpoint_ns", checkpoint_ns),
+            checkpoint_id=parent_configurable.get("checkpoint_id"),
+            checkpoint_map=None,
+        )
+
+    values = {}
+    raw_values = snapshot.values or {}
+    for k, v in raw_values.items():
+        if k == "messages":
+            if isinstance(v, list):
+                if len(v) > 0 and isinstance(v[0], BaseMessage):
+                    values["messages"] = [m.model_dump() for m in v]
+                else:
+                    values["messages"] = v
+            else:
+                values["messages"] = v
+        else:
+            values[k] = v
+
+    tasks = []
+    for t in snapshot.tasks:
+        task_checkpoint = None
+        if t.state is not None and not isinstance(t.state, (dict, StateSnapshot)):
+            pass
+        tasks.append(
+            ThreadTask(
+                id=t.id,
+                name=t.name,
+                error=str(t.error) if t.error else None,
+                interrupts=[
+                    Interrupt(value=i.value, id=i.id) for i in t.interrupts
+                ],
+                checkpoint=task_checkpoint,
+                state=None,
+                result=t.result if not isinstance(t.result, Exception) else None,
+            )
+        )
+
+    interrupts_list = [
+        Interrupt(value=i.value, id=i.id) for i in snapshot.interrupts
+    ]
+
+    metadata_obj = ThreadStateMetadata(
+        source=snapshot.metadata.get("source") if snapshot.metadata else None,
+        step=snapshot.metadata.get("step") if snapshot.metadata else None,
+        run_id=snapshot.metadata.get("run_id") if snapshot.metadata else None,
+        user_id=configurable.get("user_id"),
+        graph_id=snapshot.metadata.get("graph_id") if snapshot.metadata else None,
+        assistant_id=snapshot.metadata.get("assistant_id") if snapshot.metadata else None,
+        thread_id=thread_id,
+    )
+
+    return ThreadState(
+        values=values,
+        next=list(snapshot.next),
+        checkpoint=checkpoint,
+        metadata=metadata_obj,
+        created_at=snapshot.created_at,
+        parent_config=parent_config,
+        tasks=tasks,
+        interrupts=interrupts_list,
+    )
+
 
 class ThreadUpdateStateRequest(BaseModel):
     values: dict[str, Any] | list[dict] | None = None

@@ -1,3 +1,4 @@
+import copy as _copy
 from uuid import uuid4
 from typing import Any
 
@@ -22,8 +23,9 @@ from langgraph_api.utils.models import (
     ThreadGetStateRequest,
     ThreadGetHistoryRequest,
     convert_checkpoint_tuple_to_thread_state,
+    convert_state_snapshot_to_thread_state,
 )
-from langgraph_api.registry import get_graph_checkpointer, get_thread_store, get_graph_conn, get_user_id
+from langgraph_api.registry import get_graph_checkpointer, get_thread_store, get_graph_conn, get_user_id, GraphRegistry, _settings
 from langgraph_api.services.run_queue_service import (
     cancel_run,
     delete_run,
@@ -198,49 +200,94 @@ async def prune(payload: ThreadPruneRequest) -> dict[str, int]:
 
 # ── Thread state ────────────────────────────────────────────────────────
 
+async def _get_thread_state_via_graph(
+    thread_id: str,
+    checkpoint_id: str | None = None,
+    checkpoint_ns: str | None = None,
+    subgraphs: bool = False,
+) -> ThreadState | None:
+    """Get thread state using graph.aget_state() which correctly reconstructs
+    DeltaChannel values (e.g. messages), falling back to raw checkpointer
+    when the graph is unavailable.
+
+    We shallow-copy the compiled graph and set checkpointer on the copy so
+    that achannels_from_checkpoint (called internally by aget_state) can
+    access the saver for DeltaChannel reconstruction. The original graph's
+    checkpointer is None since graphs are registered as callables.
+    """
+    configurable: dict[str, Any] = {"thread_id": thread_id}
+    if checkpoint_id:
+        configurable["checkpoint_id"] = checkpoint_id
+    if checkpoint_ns:
+        configurable["checkpoint_ns"] = checkpoint_ns
+
+    async with get_graph_conn() as conn:
+        async with get_graph_checkpointer(conn=conn) as checkpointer:
+            config = RunnableConfig(configurable=configurable)
+            res = await checkpointer.aget_tuple(config)
+            if res is None:
+                return None
+
+            graph_id = res.metadata.get("graph_id") or res.metadata.get("agent_id")
+            if graph_id and graph_id in _settings.graph_registry:
+                try:
+                    graph = GraphRegistry.get_lg_graph(graph_id)
+                    g = _copy.copy(graph)
+                    g.checkpointer = checkpointer
+                    snapshot = await g.aget_state(
+                        {"configurable": configurable},
+                        subgraphs=subgraphs,
+                    )
+                    return convert_state_snapshot_to_thread_state(snapshot)
+                except Exception:
+                    pass
+
+            return convert_checkpoint_tuple_to_thread_state(res)
+
+
 @router.get("/{thread_id}/state")
 async def get_thread_state(thread_id: str, subgraphs: bool = False) -> ThreadState:
-    config = RunnableConfig(configurable={"thread_id": thread_id})
-    async with get_graph_checkpointer() as checkpointer:
-        res = await checkpointer.aget_tuple(config)
-    if res is None:
+    result = await _get_thread_state_via_graph(thread_id, subgraphs=subgraphs)
+    if result is None:
         raise HTTPException(status_code=404, detail=f"{thread_id} not found in store")
-    return convert_checkpoint_tuple_to_thread_state(res)
+    return result
 
 
 @router.get("/{thread_id}/state/{checkpoint_id}")
 async def get_thread_state_checkpoint_id(
     thread_id: str, checkpoint_id: str, subgraphs: bool = False
 ) -> ThreadState:
-    config = RunnableConfig(
-        configurable={"thread_id": thread_id, "checkpoint_id": checkpoint_id}
+    result = await _get_thread_state_via_graph(
+        thread_id, checkpoint_id=checkpoint_id, subgraphs=subgraphs
     )
-    async with get_graph_checkpointer() as checkpointer:
-        res = await checkpointer.aget_tuple(config)
-    if res is None:
+    if result is None:
         raise HTTPException(status_code=404, detail=f"{thread_id} not found in store")
-    return convert_checkpoint_tuple_to_thread_state(res)
+    return result
 
 
 @router.post("/{thread_id}/state/checkpoint")
 async def get_thread_state_checkpoint(
     thread_id: str, payload: ThreadGetStateRequest
 ) -> ThreadState:
-    configurable: dict[str, Any] = {"thread_id": thread_id}
+    checkpoint_id = None
+    checkpoint_ns = None
     if payload.checkpoint:
         if payload.checkpoint.checkpoint_ns:
-            configurable["checkpoint_ns"] = payload.checkpoint.checkpoint_ns
+            checkpoint_ns = payload.checkpoint.checkpoint_ns
         if payload.checkpoint.checkpoint_id:
-            configurable["checkpoint_id"] = payload.checkpoint.checkpoint_id
+            checkpoint_id = payload.checkpoint.checkpoint_id
     elif payload.checkpoint_id:
-        configurable["checkpoint_id"] = payload.checkpoint_id
+        checkpoint_id = payload.checkpoint_id
 
-    config = RunnableConfig(configurable=configurable)
-    async with get_graph_checkpointer() as checkpointer:
-        res = await checkpointer.aget_tuple(config)
-    if res is None:
+    result = await _get_thread_state_via_graph(
+        thread_id,
+        checkpoint_id=checkpoint_id,
+        checkpoint_ns=checkpoint_ns,
+        subgraphs=payload.subgraphs,
+    )
+    if result is None:
         raise HTTPException(status_code=404, detail=f"{thread_id} not found in store")
-    return convert_checkpoint_tuple_to_thread_state(res)
+    return result
 
 
 @router.post("/{thread_id}/state")
@@ -296,16 +343,40 @@ async def get_thread_history(
 
     filter_by_metadata = payload.metadata
 
-    async with get_graph_checkpointer() as checkpointer:
-        history = []
-        async for state in checkpointer.alist(
-            config,
-            limit=payload.limit,
-            before=before,
-            filter=filter_by_metadata,
-        ):
-            history.append(convert_checkpoint_tuple_to_thread_state(state))
-    return history
+    async with get_graph_conn() as conn:
+        async with get_graph_checkpointer(conn=conn) as checkpointer:
+            checkpoint_tuples = [
+                c
+                async for c in checkpointer.alist(
+                    config, before=before, limit=payload.limit, filter=filter_by_metadata
+                )
+            ]
+
+    if not checkpoint_tuples:
+        return []
+
+    graph_id = checkpoint_tuples[0].metadata.get("graph_id") or checkpoint_tuples[0].metadata.get("agent_id")
+    if graph_id and graph_id in _settings.graph_registry:
+        try:
+            graph = GraphRegistry.get_lg_graph(graph_id)
+            g = _copy.copy(graph)
+            g.checkpointer = checkpointer
+            history = []
+            async with get_graph_conn() as conn:
+                async with get_graph_checkpointer(conn=conn) as cp:
+                    g.checkpointer = cp
+                    for ct in checkpoint_tuples:
+                        snapshot = await g._aprepare_state_snapshot(
+                            ct.config,
+                            ct,
+                            apply_pending_writes=False,
+                        )
+                        history.append(convert_state_snapshot_to_thread_state(snapshot))
+            return history
+        except Exception:
+            pass
+
+    return [convert_checkpoint_tuple_to_thread_state(ct) for ct in checkpoint_tuples]
 
 
 # ── Thread stream (threads.join_stream) ──────────────────────────────────
