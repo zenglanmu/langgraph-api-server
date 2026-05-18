@@ -410,12 +410,31 @@ async def thread_join_stream(
 #   GET  /threads/{thread_id}/runs/{run_id}/stream  → join_stream (Last-Event-ID header)
 #   DELETE /threads/{thread_id}/runs/{run_id}       → delete
 
+async def _update_thread_metadata_from_run(thread_id: str, payload: StreamRunRequest) -> None:
+    if payload.metadata:
+        uid = await get_user_id()
+        async with get_thread_store() as store:
+            exist = await store.thread_get(
+                thread_id,
+                user_id=str(uid) if uid is not None else None,
+            )
+            if exist is not None:
+                new_metadata = {**exist["metadata"], **payload.metadata}
+                await store.thread_put(
+                    thread_id,
+                    metadata=new_metadata,
+                    user_id=exist.get("user_id"),
+                )
+
+
 @router.post("/{thread_id}/runs/stream", response_class=EventSourceResponse)
 async def stream_run(
     thread_id: str,
     payload: StreamRunRequest,
 ):
     await _require_thread(thread_id)
+
+    await _update_thread_metadata_from_run(thread_id, payload)
 
     run_id = await enqueue_run(
         thread_id=thread_id,
@@ -432,6 +451,8 @@ async def stream_run(
 @router.post("/{thread_id}/runs")
 async def create_run(thread_id: str, payload: StreamRunRequest) -> Run:
     await _require_thread(thread_id)
+
+    await _update_thread_metadata_from_run(thread_id, payload)
 
     run_id = await enqueue_run(
         thread_id=thread_id,
@@ -450,6 +471,8 @@ async def wait_run(
     payload: StreamRunRequest,
 ) -> dict:
     await _require_thread(thread_id)
+
+    await _update_thread_metadata_from_run(thread_id, payload)
 
     run_id = await enqueue_run(
         thread_id=thread_id,
