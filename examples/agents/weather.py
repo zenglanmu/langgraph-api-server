@@ -17,4 +17,4 @@ def build_graph():
     )
     return agent
 
-GraphRegistry.registy_lg_graph('agent', build_graph)
+GraphRegistry.registy_lg_graph('weather', build_graph)
