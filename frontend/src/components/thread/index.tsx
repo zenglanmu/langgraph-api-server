@@ -250,7 +250,7 @@ export function Thread() {
       {
         ...(submitThreadId && { threadId: submitThreadId }),
         metadata: threadMetadata,
-        streamMode: ["values"],
+        streamMode: ["messages-tuple"],
         streamSubgraphs: true,
         streamResumable: true,
         optimisticValues: (prev) => ({
@@ -277,7 +277,7 @@ export function Thread() {
     setFirstTokenReceived(false);
     stream.submit(undefined, {
       checkpoint: parentCheckpoint,
-      streamMode: ["values"],
+      streamMode: ["messages-tuple"],
       streamSubgraphs: true,
       streamResumable: true,
     });

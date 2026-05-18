@@ -164,7 +164,7 @@ async def _stream_run_lg_graph_base(
         try:
             astream_kwargs: dict[str, Any] = {
                 "config": config,
-                "stream_mode": payload.stream_mode,
+                "stream_mode": stream_mode,
                 "interrupt_before": payload.interrupt_before,
                 "interrupt_after": payload.interrupt_after,
             }
