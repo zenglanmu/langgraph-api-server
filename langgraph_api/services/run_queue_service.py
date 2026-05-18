@@ -190,7 +190,7 @@ async def _stream_run_lg_graph_base(
                         data = event[1]
                     else:
                         stream_mode = 'values'
-                        data = event                                  
+                        data = event                                
                 yield EventData(data=data, event=stream_mode, id=str(id))
         except Exception as e:
             payload_data = {"error": str(e), "run_id": str(config["run_id"])}

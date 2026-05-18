@@ -18,6 +18,31 @@ from .run_queue_service import (
     TERMINAL_RUN_STATUSES,
 )
 
+_TOOL_EVENT_MAP = {
+    "tool-started": "on_tool_start",
+    "tool-output-delta": "on_tool_event",
+    "tool-finished": "on_tool_end",
+    "tool-error": "on_tool_error",
+}
+
+
+def _translate_tools_payload(payload: dict) -> dict:
+    inner = payload if "event" in payload else payload.get("data", payload)
+    ev = inner.get("event", "")
+    if ev not in _TOOL_EVENT_MAP:
+        return payload
+    translated = {**inner, "event": _TOOL_EVENT_MAP[ev]}
+    if "tool_name" in translated:
+        translated["name"] = translated.pop("tool_name")
+    if "delta" in translated:
+        translated["data"] = translated.pop("delta")
+    if "message" in translated and ev == "tool-error":
+        translated["error"] = translated.pop("message")
+    if "data" in payload and inner is not payload:
+        return {**payload, "data": translated}
+    return translated
+
+
 SSE_HEARTBEAT_SECONDS = int(os.getenv("RUN_SSE_HEARTBEAT_SECONDS", "15"))
 SSE_MAX_CONNECTION_MINUTES = int(os.getenv("RUN_SSE_MAX_CONNECTION_MINUTES", "30"))
 SSE_POLL_INTERVAL_SECONDS = float(os.getenv("RUN_SSE_POLL_INTERVAL_SECONDS", "0.5"))
@@ -51,6 +76,9 @@ async def stream_agent_run_events(
                 seq = event["seq"]
                 last_seq = seq
                 payload = event.get("payload") or {}
+                if event.get("event_type") == "tools":                    
+                    # fix to frontend langgraph sdk wanted format
+                    payload = _translate_tools_payload(payload)
                 yield ServerSentEvent(
                     data=payload,
                     event=event.get("event_type") or "values",
