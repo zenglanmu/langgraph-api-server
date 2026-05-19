@@ -1,6 +1,5 @@
 import os
 from typing import Literal
-
 from tavily import TavilyClient
 from deepagents import create_deep_agent
 
@@ -35,7 +34,7 @@ Use this to run an internet search for a given query. You can specify the max nu
 """
 
 def build_graph():
-    llm = get_chat_client()
+    llm = get_chat_client(streaming=True)
 
     agent = create_deep_agent(
         model=llm,

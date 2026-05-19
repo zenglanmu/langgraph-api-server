@@ -2,12 +2,14 @@ import { parsePartialJson } from "@langchain/core/output_parsers";
 import { useStreamContext } from "@/providers/Stream";
 import { AIMessage, Checkpoint, Message } from "@langchain/langgraph-sdk";
 import { useStream } from "@langchain/langgraph-sdk/react";
-import { getContentString } from "../utils";
+import { getContentString, getReasoningString } from "../utils";
 import { BranchSwitcher, CommandBar } from "./shared";
 import { MarkdownText } from "../markdown-text";
 import { LoadExternalComponent } from "@langchain/langgraph-sdk/react-ui";
 import { cn } from "@/lib/utils";
+import { useState } from "react";
 import { ToolCalls, ToolResult } from "./tool-calls";
+import { ChevronDown, ChevronUp } from "lucide-react";
 import { MessageContentComplex } from "@langchain/core/messages";
 import { Fragment } from "react/jsx-runtime";
 import { isAgentInboxInterruptSchema } from "@/lib/agent-inbox-interrupt";
@@ -68,6 +70,29 @@ function parseAnthropicStreamedToolCalls(
   });
 }
 
+function ReasoningBlock({ reasoning }: { reasoning: string }) {
+  const [isExpanded, setIsExpanded] = useState(false);
+
+  return (
+    <div className="overflow-hidden rounded-lg border border-gray-200">
+      <button
+        onClick={() => setIsExpanded(!isExpanded)}
+        className="flex w-full cursor-pointer items-center gap-2 border-b border-gray-200 bg-gray-50 px-4 py-2 text-left text-sm font-medium text-gray-700 transition-colors hover:bg-gray-100"
+      >
+        <span className="text-gray-500">
+          {isExpanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+        </span>
+        Thinking
+      </button>
+      {isExpanded && (
+        <div className="bg-gray-50 px-4 py-3 text-sm whitespace-pre-wrap text-gray-600">
+          {reasoning}
+        </div>
+      )}
+    </div>
+  );
+}
+
 interface InterruptProps {
   interrupt?: unknown;
   isLastMessage: boolean;
@@ -110,6 +135,7 @@ export function AssistantMessage({
 }) {
   const content = message?.content ?? [];
   const contentString = getContentString(content);
+  const reasoning = message ? getReasoningString(message) : null;
   const [hideToolCalls] = useQueryState(
     "hideToolCalls",
     parseAsBoolean.withDefault(false),
@@ -160,6 +186,7 @@ export function AssistantMessage({
           </>
         ) : (
           <>
+            {reasoning && <ReasoningBlock reasoning={reasoning} />}
             {contentString.length > 0 && (
               <div className="py-1">
                 <MarkdownText>{contentString}</MarkdownText>

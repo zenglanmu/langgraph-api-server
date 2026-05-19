@@ -236,7 +236,8 @@ async def stream_run_lg_graph(
             if len(config["callbacks"])>0:
                 for handler in config["callbacks"]:
                     if isinstance(handler, LangfuseCallbackHandler):
-                        handler.client.flush()
+                        client = handler._get_parent_observation(parent_run_id=None)
+                        client.flush()
     else:
         async for event in _stream_run_lg_graph_base(
                 agent=agent,

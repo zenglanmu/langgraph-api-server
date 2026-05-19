@@ -1,12 +1,12 @@
 import os
-from langchain_openai import ChatOpenAI
+from langchain_deepseek import ChatDeepSeek
 
 def get_chat_client(
                 temperature: float=None,
                 streaming: bool=False,
                 model_name: str=None,
                 **kwargs
-                ) -> ChatOpenAI:
+                ) -> ChatDeepSeek:
     '''
     return chat client based on config
     temperature: What sampling temperature to use.
@@ -17,12 +17,15 @@ def get_chat_client(
     else:
         model = model_name
 
+    # model = f'openai/{model}'
+    
     OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
     OPENAI_BASEURL = os.environ.get('OPENAI_BASEURL')
-    chat_client = ChatOpenAI(
+    # for reasoning content, ChatOpenAI dont support
+    chat_client = ChatDeepSeek(
         model=model,
-        openai_api_key=OPENAI_API_KEY, 
-        base_url=OPENAI_BASEURL,
+        api_key=OPENAI_API_KEY,
+        api_base=OPENAI_BASEURL,
         temperature=temperature,
         streaming=streaming,
         **kwargs)

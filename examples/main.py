@@ -41,6 +41,9 @@ langgraph_api_lifespan = setup_api(
   embeding_dim=os.environ['LANGGRAPH_EMBED_DIMENSION'],
   embeding_base_url=os.environ['LANGGRAPH_EMBED_MODEL_BASE_URL'],
   embeding_api_key=os.environ['LANGGRAPH_EMBED_MODEL_API_KEY'],
+  langfuse_base_url=os.environ.get('LANGFUSE_HOST', None),
+  langfuse_public_key=os.environ.get('LANGFUSE_PUBLIC_KEY', None),
+  langfuse_secret_key=os.environ.get('LANGFUSE_SECRET_KEY', None),
   include_router_kwargs=dict(prefix="")
 )
 
