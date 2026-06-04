@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import AsyncExitStack, asynccontextmanager
 import os
 from inspect import isawaitable
@@ -261,6 +262,25 @@ async def get_graph_checkpointer(
         yield checkpointer
 
 
+async def _close_batched_store(store: AsyncPostgresStore) -> None:
+    """关闭 AsyncBatchedBaseStore 的后台 batch 任务，避免 pending task 警告。"""
+    if hasattr(store, "stop_ttl_sweeper"):
+        try:
+            await store.stop_ttl_sweeper(timeout=1.0)
+        except Exception:
+            pass
+
+    task = getattr(store, "_task", None)
+    if task is None or task.done():
+        return
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
 @asynccontextmanager
 async def get_graph_store(
     conn: _ainternal.Conn | None = None,
@@ -281,7 +301,10 @@ async def get_graph_store(
                     _settings.langgraph_database_uri, index=index_config
                 )
             )
-        yield store
+        try:
+            yield store
+        finally:
+            await _close_batched_store(store)
 
 
 @asynccontextmanager

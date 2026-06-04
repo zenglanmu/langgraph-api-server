@@ -415,6 +415,7 @@ async def run_lg_graph_to_redis(
     payload: StreamRunRequest,
     temporary: bool = False,
 ):
+    from ..utils.queue_worker import close_redis_client
     try:
         await set_run_status(run_id, "running")
 
@@ -456,12 +457,15 @@ async def run_lg_graph_to_redis(
             await redis.xadd(key, fields, **kwargs)
             await redis.expire(key, RUN_EVENTS_STREAM_TTL_SECONDS)
 
-
+        logger.info("run_lg_graph_to_redis: graph stream finished for run_id=%s", run_id)
         await set_run_status(run_id, "success")
+        logger.info("run_lg_graph_to_redis: run_id=%s marked success", run_id)
 
     except Exception as e:
         logger.error(f"run_lg_graph_to_redis failed: {e}", exc_info=True)
         await set_run_status(run_id, "error", error_message=str(e))
+    finally:
+        await close_redis_client()
 
 
 # ── Sync wrapper for RQ task (RQ runs sync functions) ──────────────────
@@ -476,7 +480,10 @@ def run_lg_graph_to_redis_sync(
 
     payload = StreamRunRequest.model_validate(payload_dict)
 
+    # RQ worker pool forks workers; reset inherited connection singletons.
     _qw._redis_client = None
+    _qw._sync_redis_client = None
+    _qw._rq_queue = None
 
     try:
         asyncio.run(
@@ -489,6 +496,8 @@ def run_lg_graph_to_redis_sync(
         )
     finally:
         _qw._redis_client = None
+        _qw._sync_redis_client = None
+        _qw._rq_queue = None
 
 
 # ── Enqueue run to RQ ──────────────────────────────────────────────────

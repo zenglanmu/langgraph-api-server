@@ -1,5 +1,5 @@
 import os
-from multiprocessing import Process
+from multiprocessing import get_context
 from redis import Redis
 from redis.asyncio import Redis as AsyncRedis
 import rq
@@ -126,15 +126,28 @@ def _cron_process_target(settings_data: dict):
         print("\n[*] langgraph api cron scheduler stopping...")
 
 
-def backgroud_worker_pool() -> int:
-    settings_data = _settings.snapshot()
-    p = Process(target=_worker_process_target, args=(settings_data,))
+def _spawn_background_process(target, settings_data: dict) -> int:
+    """Use spawn instead of fork to avoid inheriting broken asyncio/DB state."""
+    ctx = get_context("spawn")
+    p = ctx.Process(target=target, args=(settings_data,))
     p.start()
     return p.pid
+
+
+def backgroud_worker_pool() -> int:
+    settings_data = _settings.snapshot()
+    return _spawn_background_process(_worker_process_target, settings_data)
 
 
 def backgroud_cron() -> int:
     settings_data = _settings.snapshot()
-    p = Process(target=_cron_process_target, args=(settings_data,))
-    p.start()
-    return p.pid
+    return _spawn_background_process(_cron_process_target, settings_data)
+
+async def close_redis_client() -> None:
+    global _redis_client
+    if _redis_client is not None:
+        try:
+            await _redis_client.aclose()
+        except Exception:
+            pass
+        _redis_client = None
