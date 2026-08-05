@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["langgraph_api"]
+include = ["langgraph_api*"]
 
 [project]
 name = "langgraph-api-server"
