@@ -807,3 +807,59 @@ class AssistantSearchResponse(BaseModel):
 
 class AssistantSetVersionRequest(BaseModel):
     version: int = Field(..., description="Version to set as latest")
+
+
+# ============================================
+# Thread Command 协议模型（langgraph-sdk v1.9.28 thread-centric）
+# ============================================
+
+class ThreadCommandRequest(BaseModel):
+    """POST /threads/{thread_id}/commands 请求体"""
+    id: int  # JsUint = 0 ~ 2^53-1
+    method: str
+    params: dict[str, Any] = {}
+
+
+class ThreadCommandSuccess(BaseModel):
+    type: Literal["success"]
+    id: int
+    result: dict[str, Any] = {}
+    meta: dict[str, Any] = Field(default_factory=lambda: {"applied_through_seq": 0})
+
+
+class ThreadCommandError(BaseModel):
+    type: Literal["error"]
+    id: int | None
+    error: str  # ErrorCode
+    message: str
+    stacktrace: str | None = None
+    meta: dict[str, Any] = {}
+
+
+# ── Stream Events 协议模型 ──
+
+EventChannel = Literal[
+    "values", "updates", "messages", "tools",
+    "lifecycle", "input", "checkpoints", "tasks", "custom"
+]  # 也接受 "custom:xxx"
+
+
+class StreamEventsRequest(BaseModel):
+    """POST /threads/{thread_id}/stream/events 请求体"""
+    channels: list[str]  # EventChannel[]，含 "custom:xxx"
+    namespaces: list[list[str]] | None = None
+    depth: int | None = None
+    since: int | None = None  # 断线重放的起始 seq
+
+
+class StreamEvent(BaseModel):
+    """SSE data: JSON 行"""
+    type: Literal["event", "success", "error"]
+    event_id: str | None = None
+    seq: int | None = None
+    method: str | None = None
+    params: dict[str, Any] | None = None
+    id: int | None = None
+    result: dict | None = None
+    error: str | None = None
+    message: str | None = None

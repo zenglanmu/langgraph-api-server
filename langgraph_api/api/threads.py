@@ -22,6 +22,8 @@ from langgraph_api.utils.models import (
     ThreadUpdateStateResponse,
     ThreadGetStateRequest,
     ThreadGetHistoryRequest,
+    ThreadCommandRequest,
+    StreamEventsRequest,
     convert_checkpoint_tuple_to_thread_state,
     convert_state_snapshot_to_thread_state,
 )
@@ -36,6 +38,8 @@ from langgraph_api.services.run_queue_service import (
 )
 from langgraph_api.services.graph_run_service import stream_agent_run_events
 from langgraph_api.services.cron_service import create_cron
+from langgraph_api.services.command_handler import ThreadCommandHandler
+from langgraph_api.services.stream_events_service import stream_thread_events
 
 router = APIRouter(prefix="/threads", tags=["threads"])
 
@@ -246,22 +250,23 @@ async def _get_thread_state_via_graph(
 
 
 @router.get("/{thread_id}/state")
-async def get_thread_state(thread_id: str, subgraphs: bool = False) -> ThreadState:
+async def get_thread_state(thread_id: str, subgraphs: bool = False) -> ThreadState | None:
     result = await _get_thread_state_via_graph(thread_id, subgraphs=subgraphs)
     if result is None:
-        raise HTTPException(status_code=404, detail=f"{thread_id} not found in store")
+        # thread-centric 协议：thread 不存在时返回 null 而非 404
+        return None
     return result
 
 
 @router.get("/{thread_id}/state/{checkpoint_id}")
 async def get_thread_state_checkpoint_id(
     thread_id: str, checkpoint_id: str, subgraphs: bool = False
-) -> ThreadState:
+) -> ThreadState | None:
     result = await _get_thread_state_via_graph(
         thread_id, checkpoint_id=checkpoint_id, subgraphs=subgraphs
     )
     if result is None:
-        raise HTTPException(status_code=404, detail=f"{thread_id} not found in store")
+        return None
     return result
 
 
@@ -582,3 +587,39 @@ async def create_cron_for_thread(thread_id: str, payload: CronCreate) -> Cron:
         payload_data=payload,
     )
     return cron
+
+
+# ── Thread-centric Command & Stream Events (langgraph-sdk v1.9.28) ──────
+#   POST /threads/{thread_id}/commands        → dispatch command
+#   POST /threads/{thread_id}/stream/events   → thread-level SSE bus
+
+@router.post("/{thread_id}/commands")
+async def thread_commands(
+    thread_id: str, payload: ThreadCommandRequest, response: Response
+):
+    handler = ThreadCommandHandler(thread_id)
+    result = await handler.dispatch(payload.id, payload.method, payload.params)
+    if result is None:
+        response.status_code = 204
+        return None
+    if result.get("type") == "error":
+        err = result.get("error", "")
+        if err in ("no_such_thread", "no_such_run", "no_such_checkpoint"):
+            raise HTTPException(status_code=404, detail=result.get("message", err))
+        if err in ("invalid_argument", "unknown_command"):
+            raise HTTPException(status_code=400, detail=result.get("message", err))
+    return result
+
+
+@router.post("/{thread_id}/stream/events", response_class=EventSourceResponse)
+async def thread_stream_events(
+    thread_id: str, payload: StreamEventsRequest
+):
+    async for sse_line in stream_thread_events(
+        thread_id,
+        payload.channels,
+        payload.namespaces,
+        payload.depth,
+        payload.since,
+    ):
+        yield sse_line

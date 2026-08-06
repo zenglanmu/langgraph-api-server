@@ -708,7 +708,7 @@ wheels = [
 [[package]]
 name = "langgraph-api-server"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "aredis" },
     { name = "fastapi" },

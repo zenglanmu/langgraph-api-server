@@ -24,6 +24,7 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.runnables.config import merge_configs
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import StreamPart
+from langgraph.errors import GraphInterrupt
 from langfuse import observe, propagate_attributes, Langfuse
 from langfuse.langchain import CallbackHandler as LangfuseCallbackHandler
 from uuid_utils import uuid7
@@ -31,6 +32,11 @@ from uuid_utils import uuid7
 from ..registry import GraphRegistry, _settings, get_graph_checkpointer, get_user_id
 from ..utils.models import InputModel, StreamRunRequest
 from ..utils.queue_worker import get_redis_client
+from .stream_events_service import (
+    publish_input_requested_event,
+    publish_lifecycle_event,
+    publish_thread_event,
+)
 
 
 logger = getLogger(__name__)
@@ -192,6 +198,20 @@ async def _stream_run_lg_graph_base(
                         stream_mode = 'values'
                         data = event                                
                 yield EventData(data=data, event=stream_mode, id=str(id))
+        except GraphInterrupt as gi:
+            # 中断：发布 input.requested 事件（由 run_lg_graph_to_redis 消费）
+            interrupt_id = getattr(gi, "id", None) or str(uuid7())
+            payload = getattr(gi, "value", None) or str(gi)
+            id += 1
+            yield EventData(
+                data={
+                    "interrupt_id": interrupt_id,
+                    "payload": payload,
+                    "run_id": str(config["run_id"]),
+                },
+                event="interrupt",
+                id=str(id),
+            )
         except Exception as e:
             payload_data = {"error": str(e), "run_id": str(config["run_id"])}
             id += 1
@@ -418,6 +438,7 @@ async def run_lg_graph_to_redis(
     from ..utils.queue_worker import close_redis_client
     try:
         await set_run_status(run_id, "running")
+        await publish_lifecycle_event(thread_id, run_id, "started")
 
         async for event_data in stream_run_lg_graph(
             thread_id=thread_id,
@@ -428,11 +449,29 @@ async def run_lg_graph_to_redis(
             if await has_cancel_signal(run_id=run_id):
                 await clear_cancel_signal(run_id=run_id)
                 await set_run_status(run_id, "cancelled")
+                await publish_lifecycle_event(thread_id, run_id, "cancelled")
                 break
             
             if event_data["event"] == "error":
                 error_msg = event_data["data"].get("error", "unknown error")
                 await set_run_status(run_id, "error", error_message=error_msg)
+                await publish_lifecycle_event(thread_id, run_id, "failed")
+
+            if event_data["event"] == "interrupt":
+                # GraphInterrupt：发布 interrupted lifecycle + input.requested
+                await publish_lifecycle_event(thread_id, run_id, "interrupted")
+                interrupt_id = event_data["data"].get("interrupt_id", "")
+                interrupt_payload = event_data["data"].get("payload")
+                await publish_input_requested_event(
+                    thread_id, run_id, interrupt_id, interrupt_payload
+                )
+                # 中断不算 error，跳过 per-run Redis Stream 写入
+                continue
+
+            # 发布 thread 级事件（失败只 log warning，不影响主流程）
+            await publish_thread_event(
+                thread_id, run_id, event_data["event"], event_data["data"]
+            )
 
             redis = await get_redis_client()
             key = _event_stream_key(run_id)
@@ -459,11 +498,13 @@ async def run_lg_graph_to_redis(
 
         logger.info("run_lg_graph_to_redis: graph stream finished for run_id=%s", run_id)
         await set_run_status(run_id, "success")
+        await publish_lifecycle_event(thread_id, run_id, "completed")
         logger.info("run_lg_graph_to_redis: run_id=%s marked success", run_id)
 
     except Exception as e:
         logger.error(f"run_lg_graph_to_redis failed: {e}", exc_info=True)
         await set_run_status(run_id, "error", error_message=str(e))
+        await publish_lifecycle_event(thread_id, run_id, "failed")
     finally:
         await close_redis_client()
 
