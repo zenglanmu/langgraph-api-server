@@ -83,7 +83,7 @@ def _acquire_startup_lock() -> tuple[bool, str | None]:
 
 
 @asynccontextmanager
-async def _lg_lifespan(app: FastAPI) -> AsyncGenerator[None]:
+async def _lg_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     global _WORKER_PID, _CRON_PID, _IS_LOCK_OWNER
 
     acquired, holder = _acquire_startup_lock()
