@@ -217,10 +217,18 @@ async def stream_thread_events(
 ) -> AsyncIterator[ServerSentEvent]:
     """POST /threads/{thread_id}/stream/events 的生成器，yield ServerSentEvent。
 
-    Phase 1: 重放 since..now（从 Redis List）
-    Phase 2: Pub/Sub 实时订阅
+    为避免"先读 List 再订阅 Pub/Sub"产生的发布-订阅竞态丢事件，
+    采用"先订阅 Pub/Sub，再读 List 缓冲，用 seq 去重"的顺序：
+      1. 先 subscribe，确保订阅之后发布的事件都能被 Pub/Sub 捕获
+      2. 再 lrange 重放历史缓冲（含订阅前/订阅瞬间发布的事件）
+      3. 实时阶段用 seq 去重，跳过已通过缓冲重放过的重复事件
     """
-    # Phase 1: 重放
+    # 先订阅 Pub/Sub，确保订阅之后发布的事件不会丢失
+    redis = await get_redis_client()
+    pubsub = redis.pubsub()
+    await pubsub.subscribe(_pubsub_key(thread_id))
+
+    # 再读 List 缓冲，重放 since..now 的历史事件
     buffered = await _read_buffer_events(thread_id, since)
     last_seq = since or 0
     for ev in buffered:
@@ -237,10 +245,7 @@ async def stream_thread_events(
             id=str(seq) if seq is not None else None,
         )
 
-    # Phase 2: Pub/Sub 实时订阅
-    redis = await get_redis_client()
-    pubsub = redis.pubsub()
-    await pubsub.subscribe(_pubsub_key(thread_id))
+    # Pub/Sub 实时阶段：用 seq 去重，跳过已通过缓冲重放的事件
     try:
         # 心跳计数，避免长时间无事件时连接被中间代理断开
         heartbeat_counter = 0

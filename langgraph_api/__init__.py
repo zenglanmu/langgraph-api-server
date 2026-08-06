@@ -10,13 +10,13 @@ ai请求链路跟踪用langfuse
 而前端框架因为是vue,只能仿照官方React的api实现，幸运的是vue3有React hook的类似物
 独立成和app并行的目录，且不和appn依赖，方便后面放到别的项目下用
 '''
-import asyncio
 import os
 import signal
 import errno
 import logging
-from contextlib import asynccontextmanager, suppress
-from typing import Callable, Awaitable, AsyncIterator
+import tempfile
+from contextlib import asynccontextmanager
+from typing import Callable, AsyncGenerator
 from fastapi import APIRouter, FastAPI
 
 from .api import lg_api_router
@@ -26,7 +26,6 @@ from .utils.queue_worker import (
     backgroud_worker_pool,
     backgroud_cron,
     close_redis_client,
-    get_sync_redis_client,
 )
 
 
@@ -38,28 +37,56 @@ _WORKER_PID: int | None = None
 _CRON_PID: int | None = None
 _IS_LOCK_OWNER: bool = False
 
-_STARTUP_LOCK_KEY = "langgraph_api:bg_startup_lock"
-_STARTUP_LOCK_TTL = 60
-_STARTUP_LOCK_RENEW_INTERVAL = 20
+_STARTUP_LOCK_FILE = os.path.join(
+    tempfile.gettempdir(), "langgraph_api_bg_startup.lock"
+)
 
 
-async def _renew_startup_lock_task() -> None:
-    sync_redis = get_sync_redis_client()
-    while True:
-        await asyncio.sleep(_STARTUP_LOCK_RENEW_INTERVAL)
-        sync_redis.set(_STARTUP_LOCK_KEY, str(os.getpid()), ex=_STARTUP_LOCK_TTL)
+def _pid_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError as e:
+        if e.errno == errno.ESRCH:
+            return False
+    return True
+
+
+def _acquire_startup_lock() -> tuple[bool, str | None]:
+    """Atomically acquire the startup lock via an exclusive file create.
+
+    Returns (acquired, holder_pid_str). On stale lock (holder process dead)
+    the stale file is removed and acquisition retried.
+    """
+    for _ in range(5):
+        try:
+            fd = os.open(_STARTUP_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            try:
+                with open(_STARTUP_LOCK_FILE, "r") as f:
+                    holder = f.read().strip()
+            except FileNotFoundError:
+                holder = None
+            if holder and holder.isdigit() and _pid_exists(int(holder)):
+                return (False, holder)
+            # Stale lock: remove and retry.
+            try:
+                os.unlink(_STARTUP_LOCK_FILE)
+            except FileNotFoundError:
+                pass
+            continue
+        try:
+            os.write(fd, str(os.getpid()).encode())
+        finally:
+            os.close(fd)
+        return (True, None)
+    return (False, None)
 
 
 @asynccontextmanager
-async def _lg_lifespan(app: FastAPI) -> AsyncIterator[None]:
+async def _lg_lifespan(app: FastAPI) -> AsyncGenerator[None]:
     global _WORKER_PID, _CRON_PID, _IS_LOCK_OWNER
 
-    sync_redis = get_sync_redis_client()
-    acquired = sync_redis.set(
-        _STARTUP_LOCK_KEY, str(os.getpid()), nx=True, ex=_STARTUP_LOCK_TTL
-    )
-
-    lock_renew_task: asyncio.Task | None = None
+    acquired, holder = _acquire_startup_lock()
 
     if acquired:
         _IS_LOCK_OWNER = True
@@ -72,21 +99,14 @@ async def _lg_lifespan(app: FastAPI) -> AsyncIterator[None]:
         await close_redis_client()
         _WORKER_PID = backgroud_worker_pool()
         _CRON_PID = backgroud_cron()
-        lock_renew_task = asyncio.create_task(_renew_startup_lock_task())
     else:
         _IS_LOCK_OWNER = False
-        holder = sync_redis.get(_STARTUP_LOCK_KEY)
         logger.info(
             "langgraph_api: startup lock held by another process (pid=%s), skipping setup & background processes",
             holder,
         )
 
     yield
-
-    if lock_renew_task is not None:
-        lock_renew_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await lock_renew_task
 
     if _IS_LOCK_OWNER:
         for pid in (_WORKER_PID, _CRON_PID):
@@ -96,7 +116,10 @@ async def _lg_lifespan(app: FastAPI) -> AsyncIterator[None]:
                 except OSError as e:
                     if e.errno != errno.ESRCH:
                         raise
-        sync_redis.delete(_STARTUP_LOCK_KEY)
+        try:
+            os.unlink(_STARTUP_LOCK_FILE)
+        except FileNotFoundError:
+            pass
         _IS_LOCK_OWNER = False
 
 
@@ -108,14 +131,14 @@ def setup_api(
     langfuse_public_key: str | None = None,
     langfuse_secret_key: str | None = None,
     langfuse_base_url: str | None = None,
-    include_router_kwargs: dict = None,
-    user_id_callback: UserIdCallback = None,
+    include_router_kwargs: dict | None = None,
+    user_id_callback: UserIdCallback | None = None,
     embeding_model_name: str | None = None,
     embeding_dim: int | None = None,
     embeding_base_url: str | None = None,
     embeding_api_key: str | None = None,
-) -> AsyncIterator[None]:
-    _kwargs = include_router_kwargs if include_router_kwargs else {}
+):
+    _kwargs = include_router_kwargs or {}
     if "prefix" in _kwargs:
         prefix = _kwargs.pop("prefix")
     else:
