@@ -3,7 +3,6 @@ from typing import Literal
 from tavily import TavilyClient
 from deepagents import create_deep_agent
 
-from langgraph_api import GraphRegistry
 from .chat_model import get_chat_client
 
 tavily_client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
@@ -44,5 +43,3 @@ def build_graph():
     
     return agent
 
-
-GraphRegistry.registy_lg_graph('agent', build_graph)

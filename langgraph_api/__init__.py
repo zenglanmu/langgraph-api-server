@@ -11,7 +11,6 @@ ai请求链路跟踪用langfuse
 独立成和app并行的目录，且不和appn依赖，方便后面放到别的项目下用
 '''
 import os
-import signal
 import errno
 import logging
 import tempfile
@@ -26,6 +25,7 @@ from .utils.queue_worker import (
     backgroud_worker_pool,
     backgroud_cron,
     close_redis_client,
+    kill_background_process,
 )
 
 
@@ -111,11 +111,7 @@ async def _lg_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     if _IS_LOCK_OWNER:
         for pid in (_WORKER_PID, _CRON_PID):
             if pid is not None:
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except OSError as e:
-                    if e.errno != errno.ESRCH:
-                        raise
+                kill_background_process(pid)
         try:
             os.unlink(_STARTUP_LOCK_FILE)
         except FileNotFoundError:

@@ -571,7 +571,8 @@ async def enqueue_run(
 
     queue = get_rq_queue()
     payload_dict = payload.model_dump(mode="json")
-    queue.enqueue(
+
+    job = queue.enqueue(
         run_lg_graph_to_redis_sync,
         run_id=run_id,
         thread_id=thread_id,
@@ -579,7 +580,6 @@ async def enqueue_run(
         temporary=temporary,
         job_timeout=RUN_EVENTS_STREAM_TTL_SECONDS,
     )
-
     return run_id
 
 

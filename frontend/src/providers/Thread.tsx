@@ -62,6 +62,8 @@ export function ThreadProvider({ children }: { children: ReactNode }) {
         ...getThreadSearchMetadata(resolvedAssistantId),
       },
       limit: 100,
+      sortBy: "created_at",
+      sortOrder: "desc",
     });
 
     return threads;

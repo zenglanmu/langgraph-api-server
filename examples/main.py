@@ -33,6 +33,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+os.environ['RUN_EVENTS_STREAM_NUM_WORKERS'] = '1'
+
 langgraph_api_lifespan = setup_api(  
   router=app,
   redis_url=os.environ['REDIS_URL'],

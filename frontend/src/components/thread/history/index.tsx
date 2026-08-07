@@ -1,6 +1,7 @@
 import { Button } from "@/components/ui/button";
 import { useThreads } from "@/providers/Thread";
 import { Thread } from "@langchain/langgraph-sdk";
+import { format } from "date-fns";
 import { useEffect } from "react";
 
 import { getContentString } from "../utils";
@@ -28,7 +29,11 @@ function ThreadList({
     <div className="flex h-full w-full flex-col items-start justify-start gap-2 overflow-y-scroll [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-gray-300 [&::-webkit-scrollbar-track]:bg-transparent">
       {threads.map((t) => {
         let itemText = t.thread_id;
-        if (
+        const metadataTitle =
+          typeof t.metadata?.title === "string" ? t.metadata.title : undefined;
+        if (metadataTitle) {
+          itemText = metadataTitle;
+        } else if (
           typeof t.values === "object" &&
           t.values &&
           "messages" in t.values &&
@@ -38,6 +43,14 @@ function ThreadList({
           const firstMessage = t.values.messages[0];
           itemText = getContentString(firstMessage.content);
         }
+        let dateText: string | undefined;
+        if (t.created_at) {
+          try {
+            dateText = format(new Date(t.created_at), "MM/dd/yyyy hh:mm a");
+          } catch {
+            dateText = undefined;
+          }
+        }
         return (
           <div
             key={t.thread_id}
@@ -45,7 +58,7 @@ function ThreadList({
           >
             <Button
               variant="ghost"
-              className="w-[280px] items-start justify-start text-left font-normal"
+              className="w-[280px] flex-col items-start justify-start text-left font-normal"
               onClick={(e) => {
                 e.preventDefault();
                 onThreadClick?.(t.thread_id);
@@ -53,7 +66,12 @@ function ThreadList({
                 setThreadId(t.thread_id);
               }}
             >
-              <p className="truncate text-ellipsis">{itemText}</p>
+              <p className="w-full truncate text-ellipsis">{itemText}</p>
+              {dateText && (
+                <p className="text-xs font-normal text-muted-foreground">
+                  {dateText}
+                </p>
+              )}
             </Button>
           </div>
         );

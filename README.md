@@ -134,7 +134,7 @@ This starts both the backend API server and the frontend dev server with a singl
 **Backend only:**
 
 ```bash
-uv run python examples/main.py
+uv run python -m examples.main
 # Serves on http://127.0.0.1:2024
 ```
 

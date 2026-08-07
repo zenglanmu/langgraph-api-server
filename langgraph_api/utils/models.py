@@ -482,14 +482,14 @@ def convert_checkpoint_tuple_to_thread_state(
             merged_values[channel] = [*merged_values[channel], *pending_vals]
 
     if "messages" in merged_values:
-        messages: list[BaseMessage] = merged_values["messages"]
-        if len(messages) > 0:
-            if isinstance(messages[0], dict):
-                values['messages'] = messages
-            else:
+        messages = merged_values["messages"]
+        if isinstance(messages, list):
+            if len(messages) > 0 and isinstance(messages[0], BaseMessage):
                 values['messages'] = [m.model_dump() for m in messages]
+            else:
+                values['messages'] = messages
         else:
-            values['messages'] = []
+            values['messages'] = messages
     
     # TODO, metadata should include source, user_id, graph_id, created_by, assistant_id etc
     metadata = ThreadStateMetadata(

@@ -1,5 +1,4 @@
 from deepagents import create_deep_agent
-from langgraph_api import GraphRegistry
 from .chat_model import get_chat_client
 
 llm = get_chat_client()
@@ -16,5 +15,3 @@ def build_graph():
         system_prompt="You are a helpful assistant",
     )
     return agent
-
-GraphRegistry.registy_lg_graph('weather', build_graph)
