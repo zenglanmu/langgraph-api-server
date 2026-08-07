@@ -97,6 +97,7 @@ class EventData(TypedDict):
     event: str
     data: Any
     id: str
+    ns: list[str]
 
 
 async def _stream_run_lg_graph_base(
@@ -134,6 +135,7 @@ async def _stream_run_lg_graph_base(
         },
         event="metadata",
         id=str(id),
+        ns=[],
     )
 
     stream_mode = payload.stream_mode
@@ -189,6 +191,7 @@ async def _stream_run_lg_graph_base(
                     stream_mode = event["type"]
                     part = cast(StreamPart, event)
                     data = part["data"]
+                    ns = event.get("ns", [])
                 else:
                     # fallback
                     if isinstance(event, tuple):
@@ -197,7 +200,8 @@ async def _stream_run_lg_graph_base(
                     else:
                         stream_mode = 'values'
                         data = event                                
-                yield EventData(data=data, event=stream_mode, id=str(id))
+                    ns = []
+                yield EventData(data=data, event=stream_mode, id=str(id), ns=ns)
         except GraphInterrupt as gi:
             # 中断：发布 input.requested 事件（由 run_lg_graph_to_redis 消费）
             interrupt_id = getattr(gi, "id", None) or str(uuid7())
@@ -211,15 +215,16 @@ async def _stream_run_lg_graph_base(
                 },
                 event="interrupt",
                 id=str(id),
+                ns=[],
             )
         except Exception as e:
             payload_data = {"error": str(e), "run_id": str(config["run_id"])}
             id += 1
-            yield EventData(data=payload_data, event="error", id=str(id))
+            yield EventData(data=payload_data, event="error", id=str(id), ns=[])
             logger.error(f"Error in graph run: {e}", exc_info=True)
 
     id += 1
-    yield EventData(data=None, event="end", id=str(id))
+    yield EventData(data=None, event="end", id=str(id), ns=[])
         
 
 async def stream_run_lg_graph(
@@ -470,7 +475,8 @@ async def run_lg_graph_to_redis(
 
             # 发布 thread 级事件（失败只 log warning，不影响主流程）
             await publish_thread_event(
-                thread_id, run_id, event_data["event"], event_data["data"]
+                thread_id, run_id, event_data["event"], event_data["data"],
+                ns=event_data.get("ns", []),
             )
 
             redis = await get_redis_client()

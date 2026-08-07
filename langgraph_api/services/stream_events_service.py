@@ -59,6 +59,7 @@ async def publish_thread_event(
     run_id: str,
     stream_mode: str,
     event_data: Any,
+    ns: list[str] | None = None,
 ) -> None:
     """run_queue_service 调用：发布一个 thread 级事件。
 
@@ -73,7 +74,11 @@ async def publish_thread_event(
             "event_id": str(uuid7()),
             "seq": int(seq),
             "method": method,
-            "params": {"data": event_data, "run_id": run_id},
+            "params": {
+                "data": event_data,
+                "run_id": run_id,
+                "namespace": ns or [],
+            },
         }
         payload = json.dumps(event, ensure_ascii=False, default=str)
         await redis.rpush(_buffer_key(thread_id), payload)
@@ -101,7 +106,10 @@ async def publish_lifecycle_event(
             "event_id": str(uuid7()),
             "seq": int(seq),
             "method": "lifecycle",
-            "params": {"data": {"event": lifecycle_event, "run_id": run_id}},
+            "params": {
+                "data": {"event": lifecycle_event, "run_id": run_id},
+                "namespace": [],
+            },
         }
         payload = json.dumps(event, ensure_ascii=False, default=str)
         await redis.rpush(_buffer_key(thread_id), payload)
@@ -135,7 +143,8 @@ async def publish_input_requested_event(
                     "interrupt_id": interrupt_id,
                     "payload": payload,
                     "run_id": run_id,
-                }
+                },
+                "namespace": [],
             },
         }
         sse_payload = json.dumps(event, ensure_ascii=False, default=str)
@@ -169,22 +178,33 @@ def _match_channels(event: dict, channels: list[str]) -> bool:
     return False
 
 
-def _match_namespaces(event: dict, namespaces: list[list[str]] | None) -> bool:
-    """namespace 过滤：event 的 checkpoint_ns 在 namespaces 列表中（前缀匹配）"""
+def _match_namespaces(
+    event: dict,
+    namespaces: list[list[str]] | None,
+    depth: int | None = None,
+) -> bool:
+    """namespace + depth 过滤，与 SDK 的 namespaceMatches 语义一致。
+
+    - namespaces 为 None/空 → 放行
+    - event 的 namespace 从 params.namespace 获取（list[str]）
+    - 前缀匹配：event_ns[:len(prefix)] == prefix
+    - depth 过滤：len(event_ns) - len(prefix) <= depth
+    """
     if not namespaces:
         return True
     params = event.get("params") or {}
-    data = params.get("data") if isinstance(params, dict) else None
-    if not isinstance(data, dict):
-        # 无 namespace 信息的事件（如 lifecycle）放行
-        return True
-    ns_str = data.get("checkpoint_ns", "")
-    event_ns_parts = ns_str.split(":") if ns_str else []
-    for ns in namespaces:
-        if not ns:
+    event_ns = params.get("namespace") if isinstance(params, dict) else None
+    if not isinstance(event_ns, list):
+        event_ns = []
+    for prefix in namespaces:
+        # 前缀匹配
+        if event_ns[: len(prefix)] != prefix:
             continue
-        if event_ns_parts[: len(ns)] == ns:
-            return True
+        # depth 过滤
+        if depth is not None:
+            if len(event_ns) - len(prefix) > depth:
+                continue
+        return True
     return False
 
 
@@ -234,7 +254,7 @@ async def stream_thread_events(
     for ev in buffered:
         if not _match_channels(ev, channels):
             continue
-        if not _match_namespaces(ev, namespaces):
+        if not _match_namespaces(ev, namespaces, depth):
             continue
         seq = ev.get("seq")
         if isinstance(seq, int) and seq > last_seq:
@@ -283,7 +303,7 @@ async def stream_thread_events(
                 last_seq = seq
             if not _match_channels(ev, channels):
                 continue
-            if not _match_namespaces(ev, namespaces):
+            if not _match_namespaces(ev, namespaces, depth):
                 continue
             yield ServerSentEvent(
                 data=ev,
