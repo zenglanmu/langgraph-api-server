@@ -2,32 +2,36 @@
 Cron job management service.
 
 Persists cron records in PostgreSQL (via AsyncPostgresCron) and
-schedules actual execution through rq's CronScheduler.
+schedules actual execution through an in-process asyncio scheduler.
 
 Design:
-- API layer: create/update/delete crons → persist to DB → sync to CronScheduler via Redis
-- Worker process: CronScheduler loads all enabled crons from DB on startup,
-  then listens for runtime sync events via Redis pub/sub to add/remove jobs.
-
-The CronScheduler instance is shared between the worker process (which runs it)
-and the API process (which registers/unregisters jobs on it).
+- API layer: create/update/delete crons -> persist to DB -> notify schedulers
+  via Redis pub/sub
+- Every process runs a lightweight asyncio scheduler which loads all enabled
+  crons from DB on startup, then applies runtime sync events via Redis pub/sub
+- Multi-process deployments deduplicate fires via a Redis SETNX claim
+  (each fire time is only executed once across all processes)
 '''
 import asyncio
 import json
 import logging
+import os
 from datetime import UTC, datetime
 from uuid import uuid4
 
 from croniter import croniter
-from rq.cron import CronScheduler, CronJob
+from uuid_utils import uuid7
 
 from ..registry import get_cron_store, get_user_id, _settings
 from ..utils.models import CronCreate, CronUpdate, Cron as CronModel
-from ..utils.queue_worker import get_cron_scheduler, get_redis_client, get_rq_queue, get_sync_redis_client
+from ..utils.queue_worker import get_arq_pool, get_redis_client
 
 logger = logging.getLogger(__name__)
 
 CRON_SYNC_CHANNEL = "langgraph:cron:sync"
+
+CRON_SCHEDULER_TICK_SECONDS = float(os.getenv("CRON_SCHEDULER_TICK_SECONDS", "30"))
+CRON_FIRE_DEDUP_TTL_SECONDS = 600
 
 
 def _build_cron_payload(create_data: CronCreate) -> dict:
@@ -81,53 +85,6 @@ def _row_to_cron(row: dict) -> CronModel:
     )
 
 
-def _cron_job_meta(cron_id: str) -> dict:
-    return {"cron_id": cron_id}
-
-
-def _find_cron_job_by_id(scheduler: CronScheduler, cron_id: str) -> CronJob | None:
-    for job in scheduler.get_jobs():
-        if job.job_options.get("meta", {}).get("cron_id") == cron_id:
-            return job
-    return None
-
-
-def _remove_cron_job_by_id(scheduler: CronScheduler, cron_id: str) -> bool:
-    job = _find_cron_job_by_id(scheduler, cron_id)
-    if job is None:
-        return False
-    scheduler._cron_jobs.remove(job)
-    return True
-
-
-def _register_cron_job(
-    scheduler: CronScheduler,
-    *,
-    cron_id: str,
-    assistant_id: str,
-    thread_id: str | None,
-    schedule: str,
-    payload: dict,
-    on_run_completed: str | None,
-    metadata: dict | None = None,
-) -> CronJob:
-    _remove_cron_job_by_id(scheduler, cron_id)
-
-    return scheduler.register(
-        func=_cron_task_func,
-        queue_name=get_rq_queue().name,
-        cron=schedule,
-        kwargs={
-            "cron_id": cron_id,
-            "assistant_id": assistant_id,
-            "thread_id": thread_id,
-            "payload_dict": payload,
-            "on_run_completed": on_run_completed,
-        },
-        meta=_cron_job_meta(cron_id),
-    )
-
-
 async def _publish_cron_sync_event(event_type: str, cron_id: str, data: dict | None = None):
     redis = await get_redis_client()
     message = {
@@ -173,19 +130,6 @@ async def create_cron(
     cron = _row_to_cron(row)
 
     if enabled:
-        scheduler = get_cron_scheduler()
-        _register_cron_job(
-            scheduler,
-            cron_id=cron_id,
-            assistant_id=assistant_id,
-            thread_id=thread_id,
-            schedule=schedule,
-            payload=cron_payload,
-            on_run_completed=on_run_completed,
-            metadata=metadata,
-        )
-        scheduler.save_jobs_data()
-
         await _publish_cron_sync_event("create", cron_id, {
             "cron_id": cron_id,
             "assistant_id": assistant_id,
@@ -263,21 +207,7 @@ async def update_cron(
 
     cron = _row_to_cron(row)
 
-    scheduler = get_cron_scheduler()
-
     if cron.enabled:
-        _register_cron_job(
-            scheduler,
-            cron_id=cron_id,
-            assistant_id=cron.assistant_id,
-            thread_id=cron.thread_id,
-            schedule=cron.schedule,
-            payload=cron.payload,
-            on_run_completed=cron.on_run_completed,
-            metadata=cron.metadata,
-        )
-        scheduler.save_jobs_data()
-
         await _publish_cron_sync_event("update", cron_id, {
             "cron_id": cron_id,
             "assistant_id": cron.assistant_id,
@@ -289,9 +219,6 @@ async def update_cron(
             "on_run_completed": cron.on_run_completed,
         })
     else:
-        _remove_cron_job_by_id(scheduler, cron_id)
-        scheduler.save_jobs_data()
-
         await _publish_cron_sync_event("delete", cron_id)
 
     return cron
@@ -303,10 +230,6 @@ async def delete_cron(cron_id: str) -> bool:
         if existing is None:
             return False
         await store.cron_delete(cron_id)
-
-    scheduler = get_cron_scheduler()
-    _remove_cron_job_by_id(scheduler, cron_id)
-    scheduler.save_jobs_data()
 
     await _publish_cron_sync_event("delete", cron_id)
     return True
@@ -355,165 +278,195 @@ async def count_crons(
         )
 
 
-# ── RQ CronScheduler integration (runs in worker process) ────────────────
+# ── In-process cron scheduler (asyncio tasks) ────────────────────────────
 
-def _cron_task_func(
+# cron_id -> job details, {assistant_id, thread_id, schedule, payload,
+#                          on_run_completed, end_time, next_run}
+_cron_jobs: dict[str, dict] = {}
+_scheduler_tasks: list[asyncio.Task] = []
+
+
+def _parse_end_time(value) -> datetime | None:
+    if value is None or isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _register_cron_job(
+    *,
     cron_id: str,
     assistant_id: str,
     thread_id: str | None,
-    payload_dict: dict,
+    schedule: str,
+    payload: dict,
     on_run_completed: str | None,
-):
-    from .run_queue_service import run_lg_graph_to_redis_sync
-    from ..utils.models import StreamRunRequest
-
-    stream_req = StreamRunRequest(
-        assistant_id=assistant_id,
-        input=payload_dict.get("input"),
-        config=payload_dict.get("config"),
-        context=payload_dict.get("context"),
-        metadata=payload_dict.get("metadata"),
-        stream_mode=payload_dict.get("stream_mode"),
-        stream_subgraphs=payload_dict.get("stream_subgraphs", False),
-        stream_resumable=payload_dict.get("stream_resumable", False),
-        interrupt_before=payload_dict.get("interrupt_before"),
-        interrupt_after=payload_dict.get("interrupt_after"),
-        multitask_strategy=payload_dict.get("multitask_strategy"),
-        webhook=payload_dict.get("webhook"),
-        durability=payload_dict.get("durability"),
-        on_completion=on_run_completed,
-    )
-
-    effective_thread_id = thread_id or str(uuid4())
-    temporary = thread_id is None
-
-    run_lg_graph_to_redis_sync(
-        run_id=str(uuid4()),
-        thread_id=effective_thread_id,
-        payload_dict=stream_req.model_dump(mode="json"),
-        temporary=temporary,
-    )
-
-
-def sync_crons_to_rq_scheduler():
-    scheduler = get_cron_scheduler()
-
+    end_time,
+) -> None:
+    now = datetime.now(tz=UTC)
     try:
-        from ..registry import _settings as settings
-        from ..persistants.cron import AsyncPostgresCron
-
-        conn_string = settings.langgraph_database_uri
-        if not conn_string:
-            logger.warning("langgraph_database_uri not configured, skipping cron sync")
-            return
-
-        async def _load_crons():
-            from psycopg.rows import dict_row
-            from psycopg import AsyncConnection
-
-            async with await AsyncConnection.connect(
-                conn_string, autocommit=True, prepare_threshold=0, row_factory=dict_row,
-            ) as conn:
-                store = AsyncPostgresCron(conn)
-                return await store.cron_search(enabled=True, limit=10000)
-
-        rows = asyncio.run(_load_crons())
+        next_run = croniter(schedule, now).get_next(datetime)
     except Exception:
-        logger.error("Failed to load crons from DB", exc_info=True)
+        logger.warning(f"Invalid cron schedule for {cron_id}: {schedule}")
+        return
+    _cron_jobs[cron_id] = {
+        "assistant_id": assistant_id,
+        "thread_id": thread_id,
+        "schedule": schedule,
+        "payload": payload or {},
+        "on_run_completed": on_run_completed,
+        "end_time": _parse_end_time(end_time),
+        "next_run": next_run,
+    }
+
+
+def _apply_cron_sync_event(event: str, cron_id: str, data: dict | None) -> None:
+    if event == "delete":
+        _cron_jobs.pop(cron_id, None)
         return
 
+    if not data:
+        return
+    schedule = data.get("schedule")
+    if not schedule:
+        return
+    _register_cron_job(
+        cron_id=cron_id,
+        assistant_id=data.get("assistant_id", ""),
+        thread_id=data.get("thread_id"),
+        schedule=schedule,
+        payload=data.get("payload", {}),
+        on_run_completed=data.get("on_run_completed"),
+        end_time=data.get("end_time"),
+    )
+
+
+async def _load_crons_from_db() -> None:
+    '''启动时从 DB 加载所有 enabled 的 cron 到内存'''
+    now = datetime.now(tz=UTC)
+    async with get_cron_store() as store:
+        rows = await store.cron_search(enabled=True, limit=10000)
     for row in rows:
-        cron_id = row["cron_id"]
-        schedule = row["schedule"]
-        payload = row.get("payload", {})
-        assistant_id = row.get("assistant_id", "")
-        thread_id = row.get("thread_id")
-        on_run_completed = row.get("on_run_completed")
-
-        scheduler.register(
-            func=_cron_task_func,
-            queue_name=get_rq_queue().name,
-            cron=schedule,
-            kwargs={
-                "cron_id": cron_id,
-                "assistant_id": assistant_id,
-                "thread_id": thread_id,
-                "payload_dict": payload,
-                "on_run_completed": on_run_completed,
-            },
-            meta=_cron_job_meta(cron_id),
+        _register_cron_job(
+            cron_id=row["cron_id"],
+            assistant_id=row.get("assistant_id", ""),
+            thread_id=row.get("thread_id"),
+            schedule=row["schedule"],
+            payload=row.get("payload", {}),
+            on_run_completed=row.get("on_run_completed"),
+            end_time=row.get("end_time"),
         )
+    logger.info(f"Loaded {len(rows)} cron jobs from DB into in-process scheduler")
 
-    logger.info(f"Loaded {len(rows)} cron jobs from DB into rq CronScheduler")
+
+async def _fire_cron_job(cron_id: str, job: dict) -> None:
+    '''将到期的 cron 作为 ARQ job 入队执行'''
+    payload_dict = {**job["payload"], "assistant_id": job["assistant_id"]}
+    if job["on_run_completed"]:
+        payload_dict["on_completion"] = job["on_run_completed"]
+
+    thread_id = job["thread_id"] or str(uuid7())
+    run_id = str(uuid7())
+
+    pool = await get_arq_pool()
+    await pool.enqueue_job(
+        "run_graph_job",
+        run_id=run_id,
+        thread_id=thread_id,
+        payload_dict=payload_dict,
+        temporary=job["thread_id"] is None,
+        _job_id=run_id,
+    )
+    logger.info(f"Cron {cron_id} fired: run_id={run_id}, thread_id={thread_id}")
 
 
-def listen_cron_sync_events():
-    redis_client = get_sync_redis_client()
-    scheduler = get_cron_scheduler()
+async def _claim_and_fire_cron(cron_id: str, job: dict, fire_time: datetime) -> None:
+    '''多进程部署时通过 Redis SETNX 保证同一触发时间全局只执行一次'''
+    redis = await get_redis_client()
+    minute_slot = int(fire_time.timestamp()) // 60
+    dedup_key = f"langgraph:cron:fire:{cron_id}:{minute_slot}"
+    if not await redis.set(dedup_key, "1", nx=True, ex=CRON_FIRE_DEDUP_TTL_SECONDS):
+        return
+    await _fire_cron_job(cron_id, job)
 
-    pubsub = redis_client.pubsub()
-    pubsub.subscribe(CRON_SYNC_CHANNEL)
 
-    logger.info(f"Listening for cron sync events on {CRON_SYNC_CHANNEL}")
+async def _scheduler_tick() -> None:
+    now = datetime.now(tz=UTC)
+    for cron_id, job in list(_cron_jobs.items()):
+        end_time = job["end_time"]
+        while job["next_run"] <= now:
+            fire_time = job["next_run"]
+            job["next_run"] = croniter(job["schedule"], now).get_next(datetime)
+            if end_time is not None and fire_time > end_time:
+                _cron_jobs.pop(cron_id, None)
+                break
+            try:
+                await _claim_and_fire_cron(cron_id, job, fire_time)
+            except Exception:
+                logger.exception(f"Failed to fire cron {cron_id}")
+                break
 
-    for message in pubsub.listen():
-        if message["type"] != "message":
-            continue
 
+async def _scheduler_loop() -> None:
+    while True:
+        await asyncio.sleep(CRON_SCHEDULER_TICK_SECONDS)
         try:
-            data = json.loads(message["data"])
-            event = data["event"]
-            cron_id = data["cron_id"]
-        except (json.JSONDecodeError, KeyError):
-            logger.warning(f"Invalid cron sync message: {message['data']}")
-            continue
+            await _scheduler_tick()
+        except Exception:
+            logger.exception("Cron scheduler tick failed")
 
-        if event == "create":
-            cron_data = data.get("data", {})
-            schedule = cron_data.get("schedule")
-            if not schedule:
-                continue
 
-            scheduler.register(
-                func=_cron_task_func,
-                queue_name=get_rq_queue().name,
-                cron=schedule,
-                kwargs={
-                    "cron_id": cron_id,
-                    "assistant_id": cron_data.get("assistant_id", ""),
-                    "thread_id": cron_data.get("thread_id"),
-                    "payload_dict": cron_data.get("payload", {}),
-                    "on_run_completed": cron_data.get("on_run_completed"),
-                },
-                meta=_cron_job_meta(cron_id),
-            )
-            scheduler.save_jobs_data()
-            logger.info(f"Cron created: {cron_id}")
+async def _cron_pubsub_listener() -> None:
+    while True:
+        redis = await get_redis_client()
+        pubsub = redis.pubsub()
+        try:
+            await pubsub.subscribe(CRON_SYNC_CHANNEL)
+            logger.info(f"Listening for cron sync events on {CRON_SYNC_CHANNEL}")
+            async for message in pubsub.listen():
+                if message["type"] != "message":
+                    continue
+                try:
+                    data = json.loads(message["data"])
+                    event = data["event"]
+                    cron_id = data["cron_id"]
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    logger.warning(f"Invalid cron sync message: {message['data']}")
+                    continue
+                _apply_cron_sync_event(event, cron_id, data.get("data"))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Cron sync listener crashed, retrying in 5 seconds")
+            await asyncio.sleep(5)
+        finally:
+            try:
+                await pubsub.close()
+            except Exception:
+                pass
 
-        elif event == "update":
-            cron_data = data.get("data", {})
-            schedule = cron_data.get("schedule")
 
-            _remove_cron_job_by_id(scheduler, cron_id)
+async def start_cron_scheduler() -> None:
+    '''在当前进程的事件循环中启动 cron scheduler（asyncio tasks）'''
+    global _scheduler_tasks
+    if _scheduler_tasks:
+        return
+    await _load_crons_from_db()
+    _scheduler_tasks = [
+        asyncio.create_task(_scheduler_loop()),
+        asyncio.create_task(_cron_pubsub_listener()),
+    ]
+    logger.info("[*] langgraph api cron scheduler started")
 
-            if schedule:
-                scheduler.register(
-                    func=_cron_task_func,
-                    queue_name=get_rq_queue().name,
-                    cron=schedule,
-                    kwargs={
-                        "cron_id": cron_id,
-                        "assistant_id": cron_data.get("assistant_id", ""),
-                        "thread_id": cron_data.get("thread_id"),
-                        "payload_dict": cron_data.get("payload", {}),
-                        "on_run_completed": cron_data.get("on_run_completed"),
-                    },
-                    meta=_cron_job_meta(cron_id),
-                )
-            scheduler.save_jobs_data()
-            logger.info(f"Cron updated: {cron_id}")
 
-        elif event == "delete":
-            _remove_cron_job_by_id(scheduler, cron_id)
-            scheduler.save_jobs_data()
-            logger.info(f"Cron deleted: {cron_id}")
+async def stop_cron_scheduler() -> None:
+    for task in _scheduler_tasks:
+        task.cancel()
+    for task in _scheduler_tasks:
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    _scheduler_tasks.clear()

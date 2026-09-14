@@ -7,7 +7,6 @@ from langchain.embeddings import init_embeddings
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.store.postgres.base import PostgresIndexConfig, ANNIndexConfig
 from langgraph.checkpoint.postgres.aio import _ainternal
-import importlib
 from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 
@@ -23,27 +22,11 @@ return user id key, to sperate user thread
 UserIdCallback = Callable[[], str | int | None | Awaitable[str | int | None]]
 
 '''
-as compiled langchain graph can not pickled into new process
-and we plan to run graph in backgroud process
-a func for creating compiled graph is instead, see:
+worker 与 API 运行在同一进程内（asyncio task），
+graph builder 在注册表中直接以函数形式保存，无需序列化，见:
 https://github.com/langchain-ai/langgraph/issues/3289
 '''
 CompileGraphCallback = Callable[[], CompiledStateGraph]
-
-
-def _func_to_dotted_path(func: Callable) -> str:
-    module = func.__module__
-    qualname = func.__qualname__
-    return f"{module}:{qualname}"
-
-
-def _dotted_path_to_func(dotted_path: str) -> Callable:
-    module_path, qualname = dotted_path.rsplit(":", 1)
-    module = importlib.import_module(module_path)
-    obj = module
-    for attr in qualname.split("."):
-        obj = getattr(obj, attr)
-    return obj
 
 
 class ApiGlobalSettings:
@@ -84,7 +67,7 @@ class ApiGlobalSettings:
         embeding_base_url: str | None = None,
         embeding_api_key: str | None = None,
     ):
-        '''在主进程中设置运行时配置，user_id_callback 仅在主进程可用，不参与序列化'''
+        '''设置运行时配置，user_id_callback 可能依赖 fastapi 请求上下文，在 worker task 中调用时不一定可用'''
         self.redis_url = redis_url
         self.langfuse_public_key = langfuse_public_key
         self.langfuse_secret_key = langfuse_secret_key
@@ -97,48 +80,6 @@ class ApiGlobalSettings:
         self.embeding_base_url = embeding_base_url
         self.embeding_api_key = embeding_api_key
 
-    def snapshot(self) -> dict:
-        '''将当前配置序列化为可跨进程传递的字典，graph_registry 中的函数转为模块路径字符串，user_id_callback 不参与序列化'''
-        graph_paths = {
-            name: _func_to_dotted_path(func)
-            for name, func in self.graph_registry.items()
-        }
-        return {
-            'redis_url': self.redis_url,
-            'langfuse_public_key': self.langfuse_public_key,
-            'langfuse_secret_key': self.langfuse_secret_key,
-            'langfuse_base_url': self.langfuse_base_url,
-            'langgraph_database_uri': self.langgraph_database_uri,
-            'graph_registry': graph_paths,
-            'embeding_model_name': self.embeding_model_name,
-            'embeding_dim': self.embeding_dim,
-            'embeding_base_url': self.embeding_base_url,
-            'embeding_api_key': self.embeding_api_key,            
-        }
-
-    def load(self, data: dict):
-        '''
-        从 snapshot 产生的字典中恢复配置，graph_registry 中的函数通过模块路径动态导入还原
-        注意虽然user_id_callback在新进程中恢复了，但是他可能依赖fastapi的请求上下文，所以不一定能工作
-        '''
-        self.redis_url = data.get('redis_url')
-        self.langfuse_public_key = data.get('langfuse_public_key')
-        self.langfuse_secret_key = data.get('langfuse_secret_key')
-        self.langfuse_base_url = data.get('langfuse_base_url')
-        self._setup_langfuse_env()
-                   
-        self.langgraph_database_uri = data.get('langgraph_database_uri')
-        graph_paths = data.get('graph_registry', {})
-        self.graph_registry = {
-            name: _dotted_path_to_func(path)
-            for name, path in graph_paths.items()
-        }
-            
-        self.embeding_model_name = data.get('embeding_model_name')
-        self.embeding_dim = data.get('embeding_dim')
-        self.embeding_base_url = data.get('embeding_base_url')
-        self.embeding_api_key = data.get('embeding_api_key')
-    
     @property
     def langfuse_enabled(self)->bool:
         return self.langfuse_public_key and self.langfuse_secret_key 

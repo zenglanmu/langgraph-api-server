@@ -1,28 +1,40 @@
-import os
-import signal
+'''
+后台任务基础设施（基于 ARQ 的协程方式）。
+
+ARQ worker 与 cron scheduler 均以 asyncio task 的形式运行在当前进程内：
+- 无需 spawn 子进程，无需 kill 进程组，无需清理残留 worker / 陈旧 Redis 连接
+- 多进程部署（如 uvicorn --workers）时每个进程各跑一份：
+  - 队列消费由 Redis 队列语义保证每个 job 只被一个进程执行
+  - cron 触发通过 Redis SETNX 去重保证全局只执行一次（见 cron_service）
+- 数据库 setup() 通过 Redis 锁保证只执行一次
+'''
+import asyncio
 import logging
-from multiprocessing import get_context
+import os
+
+from arq import create_pool
+from arq.connections import ArqRedis, RedisSettings
+from arq.worker import Worker
 from redis import Redis
 from redis.asyncio import Redis as AsyncRedis
-import rq
-from rq import Queue
-from rq.worker_pool import WorkerPool
-from rq.cron import CronScheduler
-from langgraph_api.registry import _settings
+
+from ..registry import _settings
 
 
 logger = logging.getLogger(__name__)
 
 _redis_client: AsyncRedis | None = None
-_sync_redis_client: Redis | None = None
+_arq_pool: ArqRedis | None = None
+_worker_task: asyncio.Task | None = None
+_current_worker: Worker | None = None
 
-_QUEUE_NAME = "langgragh_api_worker"
-_RUN_EVENTS_STREAM_TTL_SECONDS = int(os.getenv("RUN_EVENTS_STREAM_TTL_SECONDS", "7200"))
-RUN_EVENTS_STREAM_TTL_SECONDS = _RUN_EVENTS_STREAM_TTL_SECONDS
-RUN_EVENTS_STREAM_NUM_WORKERS = int(os.getenv("RUN_EVENTS_STREAM_NUM_WORKERS", "8"))
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-_rq_queue: Queue | None = None
-_cron_scheduler: CronScheduler | None = None
+_QUEUE_NAME = "langgraph_api_worker"
+
+RUN_EVENTS_STREAM_TTL_SECONDS = int(os.getenv("RUN_EVENTS_STREAM_TTL_SECONDS", "7200"))
+
+_SETUP_LOCK_KEY = "langgraph_api:bg_setup_lock"
+_SETUP_LOCK_TTL_SECONDS = int(os.getenv("LANGGRAPH_SETUP_LOCK_TTL_SECONDS", "300"))
+_SETUP_DONE_TTL_SECONDS = int(os.getenv("LANGGRAPH_SETUP_DONE_TTL_SECONDS", "86400"))
 
 
 async def get_redis_client() -> AsyncRedis:
@@ -44,218 +56,6 @@ async def get_redis_client() -> AsyncRedis:
     return _redis_client
 
 
-def get_sync_redis_client() -> Redis:
-    global _sync_redis_client
-    if _sync_redis_client is not None:
-        return _sync_redis_client
-    _sync_redis_client = Redis.from_url(_settings.redis_url, decode_responses=True)
-    return _sync_redis_client
-
-
-def get_rq_queue() -> Queue:
-    global _rq_queue
-    if _rq_queue is not None:
-        return _rq_queue
-
-    _rq_queue = Queue(
-        _QUEUE_NAME,
-        connection=Redis.from_url(_settings.redis_url),
-        default_timeout=RUN_EVENTS_STREAM_TTL_SECONDS,
-    )
-    return _rq_queue
-
-
-def cleanup_stale_workers() -> None:
-    """Kill stale Redis client connections (BLMOVE/SUBSCRIBE) and remove stale
-    RQ worker registration keys so that zombie workers from previous runs do
-    not steal jobs from the queue.
-
-    Must be called *before* starting the worker pool.
-    """
-    try:
-        conn = Redis.from_url(_settings.redis_url, decode_responses=True)
-    except Exception:
-        return
-
-    queue_key = f"rq:queue:{_QUEUE_NAME}"
-
-    killed = 0
-    try:
-        for client in conn.client_list():
-            cmd = client.get("cmd", "").lower()
-            if cmd in ("blmove", "brpop", "blpop", "bzmpop"):
-                try:
-                    conn.client_kill(client["addr"])
-                    killed += 1
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-    if killed:
-        logger.info("cleanup_stale_workers: killed %d stale blocking clients", killed)
-
-    removed = 0
-    try:
-        for key in conn.scan_iter("rq:worker:*"):
-            conn.delete(key)
-            removed += 1
-    except Exception:
-        pass
-
-    if removed:
-        logger.info("cleanup_stale_workers: removed %d stale worker keys", removed)
-
-    try:
-        conn.delete(f"rq:scheduler-lock:{_QUEUE_NAME}")
-        conn.srem("rq:queues", queue_key)
-        conn.delete(queue_key)
-    except Exception:
-        pass
-
-    try:
-        conn.close()
-    except Exception:
-        pass
-
-
-def get_cron_scheduler() -> CronScheduler:
-    global _cron_scheduler
-    if _cron_scheduler is not None:
-        return _cron_scheduler
-
-    queue = get_rq_queue()
-    _cron_scheduler = CronScheduler(
-        connection=queue.connection,
-        logging_level=LOG_LEVEL,
-        name="langgraph_api_cron",
-    )
-    return _cron_scheduler
-
-
-def _start_worker_pool():
-    serializer = rq.serializers.DefaultSerializer
-    worker_class = rq.worker.Worker
-    job_class = rq.job.Job
-
-    queue_names = [_QUEUE_NAME]
-    queue = get_rq_queue()
-
-    pool = WorkerPool(
-        queue_names,
-        connection=queue.connection,
-        num_workers=RUN_EVENTS_STREAM_NUM_WORKERS,
-        serializer=serializer,
-        worker_class=worker_class,
-        job_class=job_class,
-        with_scheduler=True,
-    )
-    try:
-        print("\n[*] langgraph api worker starting...")
-        pool.start(burst=False, logging_level=LOG_LEVEL)        
-    except KeyboardInterrupt:
-        print("\n[*] langgraph api worker stopping...")
-
-
-def _worker_process_target(settings_data: dict):
-    _settings.load(settings_data)
-    cleanup_stale_workers()
-    _start_worker_pool()
-
-
-def _cron_process_target(settings_data: dict):
-    _settings.load(settings_data)
-
-    from ..services.cron_service import sync_crons_to_rq_scheduler, listen_cron_sync_events
-    
-    # TODO, 是否支持scheduler运行过程中动态刷新
-    sync_crons_to_rq_scheduler()
-
-    import threading
-    cron_listener_thread = threading.Thread(
-        target=listen_cron_sync_events,
-        daemon=True,
-        name="cron-sync-listener",
-    )
-    cron_listener_thread.start()
-
-    scheduler = get_cron_scheduler()
-    try:
-        scheduler.start()
-    except KeyboardInterrupt:
-        print("\n[*] langgraph api cron scheduler stopping...")
-
-
-def _setsid_wrapper(target, settings_data: dict):
-    """Module-level wrapper that creates a new session before running target.
-
-    Placed at module scope so it can be pickled by the 'spawn' start method.
-    """
-    try:
-        os.setsid()
-    except OSError:
-        pass
-    target(settings_data)
-
-
-def _spawn_background_process(target, settings_data: dict) -> int:
-    """Use spawn instead of fork to avoid inheriting broken asyncio/DB state.
-
-    The child creates a new session (setsid) so that we can later kill the
-    entire process tree (worker pool -> forked workers -> scheduler) via
-    os.killpg on shutdown.
-    """
-    ctx = get_context("spawn")
-    p = ctx.Process(
-        target=_setsid_wrapper,
-        args=(target, settings_data),
-    )
-    p.start()
-    pid = p.pid
-    if pid is None:
-        raise RuntimeError("Failed to spawn background process")
-    return pid
-
-
-def backgroud_worker_pool() -> int:
-    settings_data = _settings.snapshot()
-    return _spawn_background_process(_worker_process_target, settings_data)
-
-
-def backgroud_cron() -> int:
-    settings_data = _settings.snapshot()
-    return _spawn_background_process(_cron_process_target, settings_data)
-
-
-def kill_background_process(pid: int) -> None:
-    """Kill a background process and its entire process group.
-
-    The child was started with setsid(), so it is a session/group leader.
-    Killing the process group ensures that forked workers and scheduler
-    processes are also terminated, preventing zombie workers from stealing
-    jobs on the next run.
-    """
-    if pid is None:
-        return
-    try:
-        pgid = os.getpgid(pid)
-        os.killpg(pgid, signal.SIGTERM)
-    except (OSError, ProcessLookupError):
-        pass
-    else:
-        import time
-        for _ in range(10):
-            try:
-                os.killpg(pgid, 0)
-            except (OSError, ProcessLookupError):
-                break
-            time.sleep(0.1)
-        try:
-            os.killpg(pgid, signal.SIGKILL)
-        except (OSError, ProcessLookupError):
-            pass
-
-
 async def close_redis_client() -> None:
     global _redis_client
     if _redis_client is not None:
@@ -264,3 +64,121 @@ async def close_redis_client() -> None:
         except Exception:
             pass
         _redis_client = None
+
+
+async def get_arq_pool() -> ArqRedis:
+    '''获取用于 enqueue job 的 ARQ redis pool'''
+    global _arq_pool
+    if _arq_pool is not None:
+        return _arq_pool
+    _arq_pool = await create_pool(
+        RedisSettings.from_dsn(_settings.redis_url),
+        default_queue_name=_QUEUE_NAME,
+    )
+    return _arq_pool
+
+
+async def close_arq_pool() -> None:
+    global _arq_pool
+    if _arq_pool is not None:
+        try:
+            await _arq_pool.close(close_connection_pool=True)
+        except Exception:
+            pass
+        _arq_pool = None
+
+
+# ── Database setup (run once across all processes) ──────────────────────
+
+async def setup_database_once() -> None:
+    '''数据库初始化，通过 Redis 锁保证多进程部署时只执行一次。
+
+    - 抢到锁的进程执行 setup()，完成后将锁标记为 done（带 TTL）
+    - 未抢到锁的进程轮询等待 done 状态
+    - 持锁进程崩溃时锁自动过期，其他进程重新抢锁执行
+    '''
+    from ..persistants import setup
+
+    redis = await get_redis_client()
+    while True:
+        if await redis.set(_SETUP_LOCK_KEY, "running", nx=True, ex=_SETUP_LOCK_TTL_SECONDS):
+            try:
+                await setup()
+            except Exception:
+                await redis.delete(_SETUP_LOCK_KEY)
+                raise
+            await redis.set(_SETUP_LOCK_KEY, "done", ex=_SETUP_DONE_TTL_SECONDS)
+            return
+
+        # 未抢到锁：等待持锁进程完成 setup
+        for _ in range(_SETUP_LOCK_TTL_SECONDS * 2):
+            state = await redis.get(_SETUP_LOCK_KEY)
+            if state == "done":
+                return
+            if state is None:
+                break  # 持锁进程已退出（崩溃），重新抢锁
+            await asyncio.sleep(0.5)
+
+
+# ── In-process ARQ worker ───────────────────────────────────────────────
+
+def _build_arq_worker() -> Worker:
+    from ..services.run_queue_service import run_graph_job
+
+    return Worker(
+        [run_graph_job],
+        queue_name=_QUEUE_NAME,
+        redis_settings=RedisSettings.from_dsn(_settings.redis_url),
+        max_jobs=int(os.getenv("RUN_EVENTS_STREAM_NUM_WORKERS", "8")),
+        job_timeout=RUN_EVENTS_STREAM_TTL_SECONDS,
+        keep_result=0,
+        max_tries=1,
+        handle_signals=False,
+    )
+
+
+async def _arq_worker_loop() -> None:
+    while True:
+        global _current_worker
+        worker = _build_arq_worker()
+        _current_worker = worker
+        try:
+            await worker.async_run()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("arq worker crashed, restarting in 5 seconds")
+            try:
+                if worker._pool is not None:
+                    await worker.close()
+            except Exception:
+                pass
+            await asyncio.sleep(5)
+
+
+async def start_arq_worker() -> None:
+    '''在当前进程的事件循环中启动 ARQ worker（asyncio task）'''
+    global _worker_task
+    if _worker_task is not None:
+        return
+    logger.info("[*] langgraph api arq worker starting...")
+    _worker_task = asyncio.create_task(_arq_worker_loop())
+
+
+async def stop_arq_worker() -> None:
+    global _worker_task, _current_worker
+    if _worker_task is None:
+        return
+    _worker_task.cancel()
+    try:
+        await _worker_task
+    except asyncio.CancelledError:
+        pass
+    _worker_task = None
+
+    worker, _current_worker = _current_worker, None
+    if worker is not None and worker._pool is not None:
+        try:
+            await worker.close()
+        except Exception:
+            pass

@@ -20,7 +20,7 @@
 - **可嵌入** — 通过 `setup_api()` 挂载到任意 FastAPI 应用中，无需单独部署
 - **内置聊天界面** — React 实现的 Agent 聊天 UI（`agent-chat-ui`），位于 `frontend/` 目录
 - **PostgreSQL + Redis 持久化** — 支持线程、助手、定时任务和存储的持久化
-- **后台执行** — 长耗时 agent 任务通过 Redis rq 队列在后台 Worker 进程中执行，不阻塞 FastAPI 主进程
+- **后台执行** — 长耗时 agent 任务通过 Redis 在进程内 ARQ worker 中执行，不阻塞 FastAPI 事件循环
 - **SSE 流式输出** — 支持 Server-Sent Events 实时返回运行结果
 - **Langfuse 链路追踪** — 可选集成，用于 AI 请求可观测性
 - **向量存储** — 可选的 Embedding 支持，用于 LangGraph Store（基于 pgvector 的 HNSW 索引）
@@ -57,7 +57,7 @@ cp frontend/.env.example frontend/.env
 
 ### 3. 注册 Agent
 
-Agent 必须注册为**返回 `CompiledStateGraph` 的可调用对象**，而非预编译的图。因为编译后的图无法被 pickle 序列化到 rq Worker 子进程中。详见 [langchain-ai/langgraph#3289](https://github.com/langchain-ai/langgraph/issues/3289)。
+Agent 必须注册为**返回 `CompiledStateGraph` 的可调用对象**，而非预编译的图。详见 [langchain-ai/langgraph#3289](https://github.com/langchain-ai/langgraph/issues/3289)。
 
 ```python
 # examples/agents/weather.py
@@ -210,7 +210,7 @@ langgraph_api/
 │   ├── assistant.py
 │   └── setup.py         # 数据库表初始化
 └── utils/
-    └── queue_worker.py  # rq Worker 池 + 定时任务调度器
+    └── queue_worker.py  # 进程内 ARQ worker + 数据库初始化守卫
 
 frontend/
 ├── src/
@@ -219,24 +219,23 @@ frontend/
 │   │   ├── client.ts              # LangGraph SDK 客户端配置
 │   │   ├── Stream.tsx             # SSE 流式 Provider
 │   │   └── Thread.tsx             # 线程状态 Provider
-│   └── components/
-│       ├── thread/                # 聊天线程 UI、消息、Markdown 渲染、agent-inbox 中断处理
-│       └── ui/                    # shadcn/ui 基础组件（基于 Radix UI）
+│   ├── components/
+│   │   ├── thread/                # 聊天线程 UI、消息、Markdown 渲染、agent-inbox 中断处理
+│   │   └── ui/                    # shadcn/ui 基础组件（基于 Radix UI）
 ├── vite.config.ts                 # 开发代理: /api → http://localhost:2024
 └── package.json                   # agent-chat-ui
 ```
 
-**启动机制**：多 Worker 部署时，仅有一个进程执行数据库初始化和启动后台进程（基于 Redis 分布式锁，key 为 `langgraph_api:bg_startup_lock`）。
+**启动机制**：每个进程启动时通过 Redis 锁（key 为 `langgraph_api:bg_setup_lock`）保证数据库初始化只执行一次——第一个进程抢到锁执行 setup，其余进程等待其完成后再提供服务。
 
-**Agent 执行流程**：提交运行请求后，任务通过 Redis rq 入队。Worker 子进程从队列中获取任务，通过模块路径字符串反序列化图构建函数，编译图后执行。这样确保 CPU 密集型的 agent 工作不会拖垮 FastAPI 进程。
+**Agent 执行流程**：提交运行请求后，任务通过 ARQ（基于 Redis 的任务队列）入队，由进程内的 ARQ worker 消费执行——编译图并运行，无需子进程管理与清理。
 
-**配置传递**：`ApiGlobalSettings.snapshot()` 将注册的图函数序列化为模块路径字符串（如 `examples.agents.weather:build_graph`），Worker 子进程通过 `load()` 动态导入还原。
+**定时任务调度**：每个进程运行轻量级 asyncio 调度器，启动时从 PostgreSQL 加载 cron 记录，运行时通过 Redis pub/sub 跨进程同步；多进程部署时通过 Redis 去重保证同一触发时间全局只执行一次。
 
 ## 注意事项
 
 - 默认 API 前缀为 `/langgraph_api`（代码中为 `langgragh`，历史拼写错误），可通过 `include_router_kwargs={"prefix": "/your_prefix"}` 覆盖。
 - HNSW 索引不支持超过 2000 维的 Embedding。
-- `user_id_callback` 不参与子进程序列化，因为它可能依赖 FastAPI 请求上下文。
 - 本项目为 vibe coding 参考官方客户端 SDK 实现，API 行为可能与官方 LangGraph 服务器存在差异。
 
 ## 许可证

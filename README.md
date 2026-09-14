@@ -20,7 +20,7 @@ I vibe coding this project with the reference of the LangGraph client-side SDK, 
 - **Embeddable** — mount into any existing FastAPI app via `setup_api()`, no need to deploy a standalone server
 - **Built-in Chat UI** — React-based agent chat interface (`agent-chat-ui`) included in `frontend/`
 - **PostgreSQL + Redis backed** — persistent storage for threads, assistants, crons, and store
-- **Background execution** — long-running agent tasks are offloaded to rq workers via Redis, keeping the FastAPI process responsive
+- **Background execution** — long-running agent tasks are offloaded to an in-process ARQ worker via Redis, keeping the FastAPI process responsive
 - **SSE streaming** — supports server-sent events for real-time run output
 - **Langfuse tracing** — optional integration for AI request observability
 - **Vector store** — optional embedding support for the LangGraph store (HNSW index via pgvector)
@@ -57,7 +57,7 @@ See `.env.example` for all available variables.
 
 ### 3. Register Your Agents
 
-Agents must be registered as a **callable that returns a `CompiledStateGraph`**, not a pre-compiled graph. This is because compiled graphs cannot be pickled into rq worker subprocesses. See [langchain-ai/langgraph#3289](https://github.com/langchain-ai/langgraph/issues/3289).
+Agents must be registered as a **callable that returns a `CompiledStateGraph`**, not a pre-compiled graph. See [langchain-ai/langgraph#3289](https://github.com/langchain-ai/langgraph/issues/3289).
 
 ```python
 # examples/agents/weather.py
@@ -210,7 +210,7 @@ langgraph_api/
 │   ├── assistant.py
 │   └── setup.py         # DB table initialization
 └── utils/
-    └── queue_worker.py  # rq worker pool + cron scheduler
+    └── queue_worker.py  # in-process ARQ worker + DB setup guard
 
 frontend/
 ├── src/
@@ -226,17 +226,16 @@ frontend/
 └── package.json                   # agent-chat-ui
 ```
 
-**Startup**: Only one process in a multi-worker deployment runs DB setup and spawns background workers (Redis-based distributed lock with key `langgraph_api:bg_startup_lock`).
+**Startup**: Every process runs an DB setup guard: the first process acquires a Redis lock (`langgraph_api:bg_setup_lock`) and runs the DB setup; other processes wait for completion before serving.
 
-**Agent execution**: When a run is submitted, it's enqueued via Redis rq. Worker subprocesses pick up the job, deserialize the graph builder via its dotted module path, compile the graph, and execute it. This keeps the FastAPI process free from CPU-heavy agent work.
+**Agent execution**: When a run is submitted, it's enqueued via ARQ (Redis-backed task queue). An in-process ARQ worker picks up the job, compiles the graph, and executes it — no subprocess spawning or cleanup needed.
 
-**Settings propagation**: `ApiGlobalSettings.snapshot()` serializes registered graph functions to dotted module paths (e.g. `examples.agents.weather:build_graph`) so worker subprocesses can import them via `load()`.
+**Cron scheduling**: Each process runs a lightweight asyncio scheduler. Cron records are loaded from PostgreSQL on startup and kept in sync across processes via Redis pub/sub. Multi-process deployments deduplicate fires via a Redis claim (each fire time runs only once).
 
 ## Caveats
 
 - The default API prefix is `/langgraph_api`. Override it via `include_router_kwargs={"prefix": "/your_prefix"}`.
 - ANN (HNSW) index does not support embeddings with more than 2000 dimensions.
-- `user_id_callback` is excluded from subprocess serialization since it may depend on FastAPI request context.
 - This is a community implementation reverse-engineered from the client SDK — API behavior may differ from the official LangGraph server.
 
 ## License

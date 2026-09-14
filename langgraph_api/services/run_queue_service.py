@@ -5,7 +5,7 @@ run langgraph with custom settings and fix..
 
 核心设计：
 - enqueue_run() 在入队前生成 run_id，立即返回给API层
-- RQ worker 调用 run_lg_graph_to_redis_sync()，使用预生成的 run_id
+- ARQ worker 调用 run_graph_job()，使用预生成的 run_id
 - run_lg_graph_to_redis() 执行 graph 并将事件写入 Redis stream
 - graph_run_service.stream_agent_run_events() 从 Redis stream 轮询事件，以 SSE 返回
 '''
@@ -440,7 +440,6 @@ async def run_lg_graph_to_redis(
     payload: StreamRunRequest,
     temporary: bool = False,
 ):
-    from ..utils.queue_worker import close_redis_client
     try:
         await set_run_status(run_id, "running")
         await publish_lifecycle_event(thread_id, run_id, "started")
@@ -511,43 +510,29 @@ async def run_lg_graph_to_redis(
         logger.error(f"run_lg_graph_to_redis failed: {e}", exc_info=True)
         await set_run_status(run_id, "error", error_message=str(e))
         await publish_lifecycle_event(thread_id, run_id, "failed")
-    finally:
-        await close_redis_client()
 
 
-# ── Sync wrapper for RQ task (RQ runs sync functions) ──────────────────
+# ── ARQ job entry ──────────────────────────────────────────────────────
 
-def run_lg_graph_to_redis_sync(
+async def run_graph_job(
+    ctx,
+    *,
     run_id: str,
     thread_id: str,
     payload_dict: dict,
     temporary: bool = False,
 ):
-    from ..utils import queue_worker as _qw
-
+    '''ARQ worker 入口：执行 graph 并将事件写入 Redis stream'''
     payload = StreamRunRequest.model_validate(payload_dict)
-
-    # RQ worker pool forks workers; reset inherited connection singletons.
-    _qw._redis_client = None
-    _qw._sync_redis_client = None
-    _qw._rq_queue = None
-
-    try:
-        asyncio.run(
-            run_lg_graph_to_redis(
-                run_id=run_id,
-                thread_id=thread_id,
-                payload=payload,
-                temporary=temporary,
-            )
-        )
-    finally:
-        _qw._redis_client = None
-        _qw._sync_redis_client = None
-        _qw._rq_queue = None
+    await run_lg_graph_to_redis(
+        run_id=run_id,
+        thread_id=thread_id,
+        payload=payload,
+        temporary=temporary,
+    )
 
 
-# ── Enqueue run to RQ ──────────────────────────────────────────────────
+# ── Enqueue run to ARQ ─────────────────────────────────────────────────
 
 async def enqueue_run(
     *,
@@ -555,7 +540,7 @@ async def enqueue_run(
     payload: StreamRunRequest,
     temporary: bool = False,
 ) -> str:
-    from ..utils.queue_worker import get_rq_queue
+    from ..utils.queue_worker import get_arq_pool
     from ..registry import get_thread_store
 
     run_id = generate_run_id()
@@ -575,16 +560,14 @@ async def enqueue_run(
         except Exception:
             logger.warning(f"Failed to create run record in DB for {run_id}", exc_info=True)
 
-    queue = get_rq_queue()
-    payload_dict = payload.model_dump(mode="json")
-
-    job = queue.enqueue(
-        run_lg_graph_to_redis_sync,
+    pool = await get_arq_pool()
+    await pool.enqueue_job(
+        "run_graph_job",
         run_id=run_id,
         thread_id=thread_id,
-        payload_dict=payload_dict,
+        payload_dict=payload.model_dump(mode="json"),
         temporary=temporary,
-        job_timeout=RUN_EVENTS_STREAM_TTL_SECONDS,
+        _job_id=run_id,
     )
     return run_id
 

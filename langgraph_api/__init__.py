@@ -3,120 +3,48 @@
 并用他的stream
 目前来说langgraph_api虽然提供了和React的集成，但相当封闭不好hack
 而且实现的很神奇，是用python通过grpc端口调用go的langsmith后端，也就是说无法独立运行
-开源的缺乏auth等模块，且官方只有InMemorySaver， 开源的有一个postgres saver
+开源缺乏auth等模块，且官方只有InMemorySaver， 开源的有一个postgres saver
 本质上是想卖企业级的langsmith服务
 所以从实现的角度，还是考虑用langserve集成fastapi,或者干脆写fastapi端点
 ai请求链路跟踪用langfuse
 而前端框架因为是vue,只能仿照官方React的api实现，幸运的是vue3有React hook的类似物
 独立成和app并行的目录，且不和appn依赖，方便后面放到别的项目下用
 '''
-import os
-import errno
 import logging
-import tempfile
 from contextlib import asynccontextmanager
-from typing import Callable, AsyncGenerator
+from typing import AsyncGenerator
 from fastapi import APIRouter, FastAPI
 
 from .api import lg_api_router
 from .registry import _settings, UserIdCallback, GraphRegistry, get_graph_store, get_graph_checkpointer
-from .persistants import setup
 from .utils.queue_worker import (
-    backgroud_worker_pool,
-    backgroud_cron,
+    close_arq_pool,
     close_redis_client,
-    kill_background_process,
+    setup_database_once,
+    start_arq_worker,
+    stop_arq_worker,
 )
+from .services.cron_service import start_cron_scheduler, stop_cron_scheduler
 
 
 logger = logging.getLogger(__name__)
 
 
-
-_WORKER_PID: int | None = None
-_CRON_PID: int | None = None
-_IS_LOCK_OWNER: bool = False
-
-_STARTUP_LOCK_FILE = os.path.join(
-    tempfile.gettempdir(), "langgraph_api_bg_startup.lock"
-)
-
-
-def _pid_exists(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except OSError as e:
-        if e.errno == errno.ESRCH:
-            return False
-    return True
-
-
-def _acquire_startup_lock() -> tuple[bool, str | None]:
-    """Atomically acquire the startup lock via an exclusive file create.
-
-    Returns (acquired, holder_pid_str). On stale lock (holder process dead)
-    the stale file is removed and acquisition retried.
-    """
-    for _ in range(5):
-        try:
-            fd = os.open(_STARTUP_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        except FileExistsError:
-            try:
-                with open(_STARTUP_LOCK_FILE, "r") as f:
-                    holder = f.read().strip()
-            except FileNotFoundError:
-                holder = None
-            if holder and holder.isdigit() and _pid_exists(int(holder)):
-                return (False, holder)
-            # Stale lock: remove and retry.
-            try:
-                os.unlink(_STARTUP_LOCK_FILE)
-            except FileNotFoundError:
-                pass
-            continue
-        try:
-            os.write(fd, str(os.getpid()).encode())
-        finally:
-            os.close(fd)
-        return (True, None)
-    return (False, None)
-
-
 @asynccontextmanager
 async def _lg_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    global _WORKER_PID, _CRON_PID, _IS_LOCK_OWNER
+    # 数据库初始化：多进程部署时通过 Redis 锁保证只执行一次
+    await setup_database_once()
 
-    acquired, holder = _acquire_startup_lock()
-
-    if acquired:
-        _IS_LOCK_OWNER = True
-        logger.info(
-            "langgraph_api: acquired startup lock (pid=%s), running setup & background processes",
-            os.getpid(),
-        )
-        await setup()
-        # Close async redis before spawning workers so fork/spawn children do not inherit it.
-        await close_redis_client()
-        _WORKER_PID = backgroud_worker_pool()
-        _CRON_PID = backgroud_cron()
-    else:
-        _IS_LOCK_OWNER = False
-        logger.info(
-            "langgraph_api: startup lock held by another process (pid=%s), skipping setup & background processes",
-            holder,
-        )
+    # ARQ worker 与 cron scheduler 以 asyncio task 形式运行在当前进程内
+    await start_arq_worker()
+    await start_cron_scheduler()
 
     yield
 
-    if _IS_LOCK_OWNER:
-        for pid in (_WORKER_PID, _CRON_PID):
-            if pid is not None:
-                kill_background_process(pid)
-        try:
-            os.unlink(_STARTUP_LOCK_FILE)
-        except FileNotFoundError:
-            pass
-        _IS_LOCK_OWNER = False
+    await stop_arq_worker()
+    await stop_cron_scheduler()
+    await close_arq_pool()
+    await close_redis_client()
 
 
 def setup_api(
