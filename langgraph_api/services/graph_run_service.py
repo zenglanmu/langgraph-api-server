@@ -76,12 +76,21 @@ async def stream_agent_run_events(
                 seq = event["seq"]
                 last_seq = seq
                 payload = event.get("payload") or {}
-                if event.get("event_type") == "tools":                    
+                event_type = event.get("event_type") or "values"
+                if event_type == "tools":
                     # fix to frontend langgraph sdk wanted format
                     payload = _translate_tools_payload(payload)
+                # 子图事件：把 namespace 编进 SSE 事件名（官方 v2 约定 "<event>|<ns...>"），
+                # 前端 langgraph SDK 据此把子智能体事件路由到对应的 task 调用。
+                ns = event.get("ns") or []
+                event_name = (
+                    "|".join([event_type, *[str(seg) for seg in ns]])
+                    if ns
+                    else event_type
+                )
                 yield ServerSentEvent(
                     data=payload,
-                    event=event.get("event_type") or "values",
+                    event=event_name,
                     id=last_seq
                 )
 

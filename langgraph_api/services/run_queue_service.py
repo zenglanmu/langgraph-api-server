@@ -175,6 +175,11 @@ async def _stream_run_lg_graph_base(
                 "stream_mode": stream_mode,
                 "interrupt_before": payload.interrupt_before,
                 "interrupt_after": payload.interrupt_after,
+                # 开启子图流式：deepagents 的 task 工具在 tools 节点内以嵌套图方式
+                # 运行子智能体，subgraphs=True 时其 messages/updates/custom 事件会带上
+                # namespace（形如 ("tools:<task_id>",)），前端据此把子智能体过程归到
+                # 对应的 task 调用下。由客户端 stream_subgraphs 控制，默认关闭以兼容旧行为。
+                "subgraphs": bool(payload.stream_subgraphs),
             }
             if command is not None:
                 astream_kwargs["command"] = command
@@ -339,11 +344,19 @@ async def list_run_stream_events(
         else:
             payload = {}
             
+        try:
+            ns = json.loads(fields.get("ns") or "[]")
+        except (TypeError, ValueError):
+            ns = []
+        if not isinstance(ns, list):
+            ns = []
+
         events.append({
             "seq": str(stream_id),
             "id": fields.get("id", "0"),
             "event_type": fields.get("event", "values"),
             "payload": payload,
+            "ns": ns,
             "ts": fields.get("ts"),
         })
 
@@ -485,6 +498,9 @@ async def run_lg_graph_to_redis(
             fields = {
                 "id": event_data["id"],
                 "event": event_data["event"],
+                # 子图（子智能体）事件的 namespace，随 run stream 持久化，
+                # 供 /runs/stream 还原成 "<event>|<ns...>" 的 SSE 事件名。
+                "ns": json.dumps(event_data.get("ns") or [], ensure_ascii=False),
                 "ts": str(now_ms),
             }
             if event_data["data"]:
