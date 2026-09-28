@@ -47,6 +47,19 @@ RUN_EVENTS_STREAM_TTL_SECONDS = int(os.getenv("RUN_EVENTS_STREAM_TTL_SECONDS", "
 RUN_EVENTS_STREAM_MAXLEN = int(os.getenv("RUN_EVENTS_STREAM_MAXLEN", "0"))
 
 TERMINAL_RUN_STATUSES = frozenset({"success", "error", "cancelled", "timeout"})
+NON_TERMINAL_RUN_STATUSES = frozenset({"pending", "running"})
+
+# run 状态 → thread 状态映射：运行中的 run 让 thread 处于 busy，终态回落到 idle/error，
+# 供前端通过 GET /threads/{id} 判断会话是否仍在运行（决定是否续接断点 stream）。
+_THREAD_STATUS_BY_RUN_STATUS: dict[str, str] = {
+    "pending": "busy",
+    "running": "busy",
+    "success": "idle",
+    "cancelled": "idle",
+    "timeout": "idle",
+    "error": "error",
+    "interrupted": "interrupted",
+}
 
 
 def generate_run_id() -> str:
@@ -397,7 +410,11 @@ async def set_run_status(
         from ..registry import get_thread_store
 
         async with get_thread_store() as store:
-            await store.run_update(run_id, **db_kwargs)
+            row = await store.run_update(run_id, **db_kwargs)
+            # 同步 thread 状态，保证 GET /threads/{id}.status 反映运行中/空闲
+            thread_status = _THREAD_STATUS_BY_RUN_STATUS.get(status)
+            if row and thread_status and row.get("thread_id"):
+                await store.thread_update_status(row["thread_id"], thread_status)
     except Exception:
         logger.warning(f"Failed to persist run status to DB for {run_id}", exc_info=True)
 
@@ -573,6 +590,9 @@ async def enqueue_run(
                     assistant_id=payload.assistant_id,
                     multitask_strategy=payload.multitask_strategy,
                 )
+                # run_put 之后 run 记录才存在，此时置 thread 为 busy，
+                # 前端打开历史会话即可据此判定「运行中」并续接断点 stream。
+                await store.thread_update_status(thread_id, "busy")
         except Exception:
             logger.warning(f"Failed to create run record in DB for {run_id}", exc_info=True)
 
@@ -628,6 +648,27 @@ async def list_runs(
         return await store.run_list(thread_id, limit=limit, offset=offset, status=status)
 
 
+async def get_active_run_id(thread_id: str) -> str | None:
+    """返回 thread 当前处于非终态（pending/running）的 run_id，无则返回 None。
+
+    优先取最新的 running，其次 pending；DB 状态由 :func:`set_run_status` 维护，
+    正常路径下足够准确。极端情况下用 Redis 状态对最近若干条 run 复核兜底。
+    """
+    for status in ("running", "pending"):
+        rows = await list_runs(thread_id, limit=1, status=status)
+        if rows:
+            return rows[0]["run_id"]
+
+    # DB 状态可能滞后（例如 worker 刚置 running 但事务未提交），用 Redis 复核
+    rows = await list_runs(thread_id, limit=10)
+    for row in rows:
+        redis_status = await get_run_status(row["run_id"])
+        current = redis_status.get("status") if redis_status else row.get("status")
+        if current in NON_TERMINAL_RUN_STATUSES:
+            return row["run_id"]
+    return None
+
+
 async def delete_run(run_id: str) -> None:
     from ..registry import get_thread_store
 
@@ -648,8 +689,6 @@ async def cancel_run(
     action: str = "interrupt",
     wait: bool = False,
 ) -> None:
-    from ..registry import get_thread_store
-
     await publish_cancel_signal(run_id)
 
     if action == "rollback":
@@ -662,8 +701,8 @@ async def cancel_run(
             if status and status.get("status") in TERMINAL_RUN_STATUSES:
                 return
 
-    async with get_thread_store() as store:
-        await store.run_update(run_id, status="cancelled")
+    # 走 set_run_status：同时同步 Redis 状态、runs 表与所属 thread 的 status
+    await set_run_status(run_id, "cancelled")
 
 
 async def wait_for_run(run_id: str, timeout: int = 600) -> dict:

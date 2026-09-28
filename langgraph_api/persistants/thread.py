@@ -310,6 +310,19 @@ ON thread_vectors USING %(index_type)s (embedding %(ops)s);
 
             return dict(row)
 
+    async def thread_update_status(self, thread_id: str, status: str) -> None:
+        """Update only the ``status`` column of a thread (idle/busy/interrupted/error).
+
+        Unlike :meth:`thread_put`, this never touches metadata/values, so run
+        lifecycle transitions can flip the status without wiping thread state.
+        """
+        async with self._cursor() as cur:
+            await cur.execute(
+                "UPDATE threads SET status = %s, updated_at = CURRENT_TIMESTAMP "
+                "WHERE thread_id = %s",
+                (status, thread_id),
+            )
+
     async def _upsert_thread_vectors(
         self,
         cur: AsyncCursor[DictRow],

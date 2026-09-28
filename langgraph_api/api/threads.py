@@ -4,7 +4,7 @@ from typing import Any
 
 from langchain_core.runnables import RunnableConfig
 from fastapi import APIRouter, Header, HTTPException, Query, Response
-from fastapi.sse import EventSourceResponse
+from fastapi.sse import EventSourceResponse, ServerSentEvent
 
 from langgraph_api.utils.models import (
     Cron,
@@ -32,6 +32,7 @@ from langgraph_api.services.run_queue_service import (
     cancel_run,
     delete_run,
     enqueue_run,
+    get_active_run_id,
     get_run,
     list_runs,
     wait_for_run,
@@ -127,6 +128,7 @@ async def update(thread_id: str, payload: ThreadUpdateRequest) -> Thread:
         row = await store.thread_put(
             thread_id,
             metadata=new_metadata,
+            status=exist.get("status"),
             user_id=exist.get("user_id"),
         )
     return _row_to_thread(row)
@@ -394,10 +396,25 @@ async def thread_join_stream(
     stream_mode: str | None = Query("run_modes", description="Stream mode(s)"),
     last_event_id: str | None = Header(None, alias="Last-Event-ID", description="Last event ID for reconnection"),
 ):
+    """Thread 级断点 stream：自动定位该 thread 当前运行中的 run 并续接其事件流。
+
+    与 run 级 ``GET /threads/{thread_id}/runs/{run_id}/stream`` 不同，调用方无需事先
+    知道 run_id——前端打开历史会话时只持有 thread_id，据此查询会话状态后直接续接。
+    若 thread 当前没有运行中的 run（idle），立即返回一个终态事件，避免连接悬挂。
+    """
     await _require_thread(thread_id)
 
+    run_id = await get_active_run_id(thread_id)
+    if run_id is None:
+        yield ServerSentEvent(
+            data={"run_id": None, "status": "idle", "last_seq": last_event_id or "0-0"},
+            event="values",
+            id=last_event_id or "0-0",
+        )
+        return
+
     async for event in stream_agent_run_events(
-        run_id=None,
+        run_id=run_id,
         after_seq=last_event_id,
     ):
         yield event
@@ -428,6 +445,7 @@ async def _update_thread_metadata_from_run(thread_id: str, payload: StreamRunReq
                 await store.thread_put(
                     thread_id,
                     metadata=new_metadata,
+                    status=exist.get("status"),
                     user_id=exist.get("user_id"),
                 )
 
