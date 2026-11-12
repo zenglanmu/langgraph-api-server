@@ -16,7 +16,14 @@ from typing import AsyncGenerator
 from fastapi import APIRouter, FastAPI
 
 from .api import lg_api_router
-from .registry import _settings, UserIdCallback, GraphRegistry, get_graph_store, get_graph_checkpointer
+from .registry import (
+    _settings,
+    UserIdCallback,
+    StreamDataFilter,
+    GraphRegistry,
+    get_graph_store,
+    get_graph_checkpointer,
+)
 from .utils.queue_worker import (
     close_arq_pool,
     close_redis_client,
@@ -61,6 +68,7 @@ def setup_api(
     embeding_dim: int | None = None,
     embeding_base_url: str | None = None,
     embeding_api_key: str | None = None,
+    stream_data_filter: StreamDataFilter | None = None,
 ):
     _kwargs = include_router_kwargs or {}
     if "prefix" in _kwargs:
@@ -80,6 +88,7 @@ def setup_api(
         embeding_dim=embeding_dim,
         embeding_base_url=embeding_base_url,
         embeding_api_key=embeding_api_key,
+        stream_data_filter=stream_data_filter,
     )
 
     return _lg_lifespan

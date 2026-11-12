@@ -2,7 +2,7 @@ import asyncio
 from contextlib import AsyncExitStack, asynccontextmanager
 import os
 from inspect import isawaitable
-from typing import AsyncIterator, Awaitable, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable
 from langchain.embeddings import init_embeddings
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.store.postgres.base import PostgresIndexConfig, ANNIndexConfig
@@ -28,6 +28,12 @@ https://github.com/langchain-ai/langgraph/issues/3289
 '''
 CompileGraphCallback = Callable[[], CompiledStateGraph]
 
+'''
+stream 事件 data 脱敏钩子：(event, data, ns) -> data。
+由业务层传入（如 cadqa 隐藏读图工具的大段返回），在事件写入 Redis / SSE 前调用。
+'''
+StreamDataFilter = Callable[[str, Any, list[str]], Any]
+
 
 class ApiGlobalSettings:
     '''run time config'''
@@ -35,7 +41,7 @@ class ApiGlobalSettings:
         'graph_registry', 'redis_url',
         'langfuse_public_key', 'langfuse_secret_key', 'langfuse_base_url',
         'langgraph_database_uri', 'user_id_callback', 'embeding_model_name',
-        'embeding_dim', 'embeding_base_url', 'embeding_api_key'
+        'embeding_dim', 'embeding_base_url', 'embeding_api_key', 'stream_data_filter'
     ]
     
     def __init__(self):
@@ -46,6 +52,8 @@ class ApiGlobalSettings:
         self.langgraph_database_uri: str | None = None
         self.user_id_callback: UserIdCallback | None = None
         self.redis_url: str | None = None
+        '''事件 data 脱敏钩子；None 表示不处理。'''
+        self.stream_data_filter: StreamDataFilter | None = None
         
         '''向量化相关，embeding_model_name例子openai:Qwen/Qwen3-VL-Embedding-2B，openai表示协议'''
         self.embeding_model_name: str | None = None
@@ -66,6 +74,7 @@ class ApiGlobalSettings:
         embeding_dim: int | None = None,
         embeding_base_url: str | None = None,
         embeding_api_key: str | None = None,
+        stream_data_filter: StreamDataFilter | None = None,
     ):
         '''设置运行时配置，user_id_callback 可能依赖 fastapi 请求上下文，在 worker task 中调用时不一定可用'''
         self.redis_url = redis_url
@@ -79,6 +88,7 @@ class ApiGlobalSettings:
         self.embeding_dim = embeding_dim
         self.embeding_base_url = embeding_base_url
         self.embeding_api_key = embeding_api_key
+        self.stream_data_filter = stream_data_filter
 
     @property
     def langfuse_enabled(self)->bool:

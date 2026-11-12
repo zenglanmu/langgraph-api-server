@@ -219,6 +219,16 @@ async def _stream_run_lg_graph_base(
                         stream_mode = 'values'
                         data = event                                
                     ns = []
+                # 业务层脱敏钩子：在事件写入 Redis / SSE 之前裁剪大段工具结果。
+                # 只改传输内容，不影响图状态与模型上下文。
+                if _settings.stream_data_filter is not None:
+                    try:
+                        data = _settings.stream_data_filter(stream_mode, data, ns)
+                    except Exception:
+                        logger.warning(
+                            "stream_data_filter failed for event=%s", stream_mode,
+                            exc_info=True,
+                        )
                 yield EventData(data=data, event=stream_mode, id=str(id), ns=ns)
         except GraphInterrupt as gi:
             # 中断：发布 input.requested 事件（由 run_lg_graph_to_redis 消费）
