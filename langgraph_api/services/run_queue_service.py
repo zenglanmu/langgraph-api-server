@@ -480,6 +480,9 @@ async def run_lg_graph_to_redis(
     payload: StreamRunRequest,
     temporary: bool = False,
 ):
+    # 运行过程中若已被判定为终态（error / cancelled），循环结束后不能再覆盖成
+    # success：否则 runs.status 会与 error_message 自相矛盾，前端只能看到"成功"。
+    terminal_status: str | None = None
     try:
         await set_run_status(run_id, "running")
         await publish_lifecycle_event(thread_id, run_id, "started")
@@ -494,10 +497,12 @@ async def run_lg_graph_to_redis(
                 await clear_cancel_signal(run_id=run_id)
                 await set_run_status(run_id, "cancelled")
                 await publish_lifecycle_event(thread_id, run_id, "cancelled")
+                terminal_status = "cancelled"
                 break
-            
+
             if event_data["event"] == "error":
                 error_msg = event_data["data"].get("error", "unknown error")
+                terminal_status = "error"
                 await set_run_status(run_id, "error", error_message=error_msg)
                 await publish_lifecycle_event(thread_id, run_id, "failed")
 
@@ -544,10 +549,17 @@ async def run_lg_graph_to_redis(
             await redis.xadd(key, fields, **kwargs)
             await redis.expire(key, RUN_EVENTS_STREAM_TTL_SECONDS)
 
-        logger.info("run_lg_graph_to_redis: graph stream finished for run_id=%s", run_id)
-        await set_run_status(run_id, "success")
-        await publish_lifecycle_event(thread_id, run_id, "completed")
-        logger.info("run_lg_graph_to_redis: run_id=%s marked success", run_id)
+        if terminal_status is None:
+            logger.info("run_lg_graph_to_redis: graph stream finished for run_id=%s", run_id)
+            await set_run_status(run_id, "success")
+            await publish_lifecycle_event(thread_id, run_id, "completed")
+            logger.info("run_lg_graph_to_redis: run_id=%s marked success", run_id)
+        else:
+            logger.info(
+                "run_lg_graph_to_redis: run_id=%s already terminal (%s), keep status",
+                run_id,
+                terminal_status,
+            )
 
     except Exception as e:
         logger.error(f"run_lg_graph_to_redis failed: {e}", exc_info=True)
